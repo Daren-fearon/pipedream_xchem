@@ -1,0 +1,18 @@
+Mode: "specific_datasets" # 'pending_analysis' or 'specific_datasets' - the former will parse your database file for all datasets with RefinementOutcome "1 - Pending Analysis", the later will use a specified list of datasets provided in the csv file specified below
+
+Processing_directory: /dls/labxchem/data/lb32627/lb32627-66/processing
+Output_directory: /dls/labxchem/data/lb32627/lb32627-66/processing/output/analysis/Pipedream/Pipedream_run_1_nosolv # Optional - defaults to Processing_directory/analysis/Pipedream/Pipedream_<timestamp> if not set
+Database_path: /dls/labxchem/data/lb32627/lb32627-66/processing/database/soakDBDataFile.sqlite
+Dataset_csv_path: /dls/science/groups/i04-1/software/pipedream/pipedream_slurm_test/datasets.csv # Only required if Mode is 'specific_datasets'
+
+Copy_files_to_working_dir: true
+Remove_crystallisation_components: true  # Optional - removes DMS, EDO, GOL, SO4, PO4, PEG from input PDBs if true (can skip if not modelled in site of interest in MR model)
+Refinement_parameters: #For more information see https://www.globalphasing.com/buster/manual/pipedream/manual/index.html#_details_of_command_line_arguments
+  keepwater: true #DO NOT remove waters that are present in the input model (default is to remove them)
+  mrefine: "TLSbasic" #"TLSbasic" turns on TLS refinement and autoncs. Leave blank for no TLS.
+  remediate: true #Run SideAide to refit side chains
+  sidechainrebuild: true #Allow SideAide to rebuild stubbed sidechains
+  runpepflip: true #Run pepflip to check for and correct peptide bond flips
+  rhocommands:
+    - -xclusters 1 # Produces ligand fits for the <n> best possible binding sites. Leave blank for default and fit to <NCS> best sites.
+    - -nochirals # Ignore CHIRAL restraints in fitting/output. Chiral centres can then invert as needed.
