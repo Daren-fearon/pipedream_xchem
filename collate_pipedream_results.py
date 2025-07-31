@@ -1,21 +1,795 @@
+"""
+Pipedream Results Collation and Analysis Script
+
+This script collates and analyzes results from completed Pipedream crystallographic 
+refinement runs. It processes multiple datasets, performs chirality analysis by 
+comparing input and output ligand structures, extracts validation statistics, and 
+generates comprehensive interactive HTML and JSON reports for quality assessment.
+
+Features:
+- Chirality inversion detection comparing input SMILES/PDB with output PDB structures
+- Ligand validation statistics extraction (correlation coefficients, B-factors, etc.)
+- MolProbity and structural quality metrics analysis
+- SMILES extraction from refined ligand structures
+- Interactive HTML reports with file links and data filtering
+- Map file generation from MTZ files using gemmi
+
+Author: DFearon
+Date: July 2025
+"""
+
 import os
 import json
 import pandas as pd
 import logging
 import argparse
+import sys
+import traceback
 from datetime import datetime
 import webbrowser
 import subprocess
 from collections import OrderedDict
 from typing import Any, Dict, List, Tuple, Optional
+from rdkit import Chem
+from rdkit.Chem import AllChem
+from rdkit.Geometry import Point3D
+import gemmi
+
+# Version information
+VERSION = "1.0.0"
+
+# Constants
+MIN_LIGAND_ATOMS = 5
+MCS_TIMEOUT_SECONDS = 30
+MIN_MCS_ATOMS = 5
+MAX_DEBUG_FILES_DISPLAY = 5
+LIGAND_CC_THRESHOLD = 0.8
+B_FACTOR_RATIO_THRESHOLD = 1.5
+
+
+def check_gemmi_availability():
+    """
+    Check if gemmi is available and return the command to use.
+    
+    Returns:
+        tuple: (is_available: bool, command: List[str] or None)
+    """
+    # Try direct gemmi command first
+    try:
+        result = subprocess.run(['gemmi', '--version'], 
+                              capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            logging.debug(f"gemmi command available: {result.stdout.strip()}")
+            return True, ['gemmi']
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception) as e:
+        logging.debug(f"Direct gemmi command not available: {e}")
+    
+    # Try python -m gemmi as fallback
+    try:
+        result = subprocess.run([sys.executable, '-m', 'gemmi', '--version'], 
+                              capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            logging.debug(f"python -m gemmi available: {result.stdout.strip()}")
+            return True, [sys.executable, '-m', 'gemmi']
+    except Exception as e:
+        logging.debug(f"python -m gemmi not available: {e}")
+    
+    # Try BUSTER gemmi path as final fallback
+    buster_gemmi_path = '/dls_sw/apps/GPhL/BUSTER/20240123/autoBUSTER/bin/linux64/gemmi'
+    try:
+        result = subprocess.run([buster_gemmi_path, '--version'], 
+                              capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            logging.debug(f"BUSTER gemmi available: {result.stdout.strip()}")
+            return True, [buster_gemmi_path]
+    except Exception as e:
+        logging.debug(f"BUSTER gemmi not available: {e}")
+    
+    logging.debug("No gemmi installation found")
+    return False, None
+
+# CIF/PDB handling functions (from compare_chirality.py)
+def load_mol_from_cif(cif_path):
+    BOND_TYPES = {
+        'SING': Chem.BondType.SINGLE, 'SINGLE': Chem.BondType.SINGLE,
+        'DOUB': Chem.BondType.DOUBLE, 'DOUBLE': Chem.BondType.DOUBLE,
+        'TRIP': Chem.BondType.TRIPLE, 'TRIPLE': Chem.BondType.TRIPLE,
+        'AROM': Chem.BondType.AROMATIC, 'AROMATIC': Chem.BondType.AROMATIC,
+    }
+
+    def strip_quotes(s): return s.strip('"').strip("'")
+
+    doc = gemmi.cif.read_file(cif_path)
+    block = doc.find_block("comp_LIG") or doc.sole_block()
+
+    mol = Chem.RWMol()
+    conf = Chem.Conformer()
+
+    comp_ids = block.find_loop("_chem_comp_atom.comp_id")
+    atom_ids = block.find_loop("_chem_comp_atom.atom_id")
+    atom_symbols = block.find_loop("_chem_comp_atom.type_symbol")
+    x = block.find_loop("_chem_comp_atom.x") or block.find_loop("_chem_comp_atom.model_Cartn_x")
+    y = block.find_loop("_chem_comp_atom.y") or block.find_loop("_chem_comp_atom.model_Cartn_y")
+    z = block.find_loop("_chem_comp_atom.z") or block.find_loop("_chem_comp_atom.model_Cartn_z")
+    charges = [0] * len(atom_ids)
+    if block.find_loop("_chem_comp_atom.charge"):
+        charges = list(block.find_loop("_chem_comp_atom.charge"))
+    elif block.find_loop("_chem_comp_atom.partial_charge"):
+        charges = list(block.find_loop("_chem_comp_atom.partial_charge"))
+
+    atoms = {}
+    for name, s, id, px, py, pz, charge in zip(comp_ids, atom_symbols, atom_ids, x, y, z, charges):
+        id = strip_quotes(id)
+        if len(s) == 2: s = s[0] + s[1].lower()
+        atom = Chem.Atom(s)
+        atom.SetFormalCharge(round(float(charge)))
+        atom.SetProp("atom_id", id)
+        idx = mol.AddAtom(atom)
+        atom.SetIntProp("idx", idx)
+        atoms[id] = atom
+        conf.SetAtomPosition(idx, Point3D(float(px), float(py), float(pz)))
+
+    atom1 = block.find_loop("_chem_comp_bond.atom_id_1")
+    atom2 = block.find_loop("_chem_comp_bond.atom_id_2")
+    bond_type = block.find_loop("_chem_comp_bond.type") or block.find_loop("_chem_comp_bond.value_order")
+
+    for a1, a2, bt in zip(atom1, atom2, bond_type):
+        mol.AddBond(atoms[strip_quotes(a1)].GetIntProp("idx"),
+                    atoms[strip_quotes(a2)].GetIntProp("idx"),
+                    BOND_TYPES[bt.upper()])
+
+    mol.AddConformer(conf)
+    Chem.SanitizeMol(mol)
+    Chem.AssignStereochemistryFrom3D(mol)
+    return mol
+
+def assign_coordinates_from_pdb(mol, pdb_path, dataset_name="Unknown", structure_type="Unknown"):
+    with open(pdb_path, 'r') as f:
+        pdb_block = f.read()
+    pdb_mol = Chem.MolFromPDBBlock(pdb_block, removeHs=False)
+    if pdb_mol is None:
+        raise ValueError("Failed to parse PDB file.")
+    
+    mol_with_h = Chem.AddHs(mol)
+    
+    # Try constrained embedding first
+    try:
+        AllChem.ConstrainedEmbed(mol_with_h, pdb_mol)
+    except ValueError:
+        # ConstrainedEmbed failed - this is normal when CIF and PDB have 
+        # structural differences (e.g., after stereochemical changes)
+        conf = Chem.Conformer(mol_with_h.GetNumAtoms())
+        
+        # Get the conformers safely
+        try:
+            pdb_conf = pdb_mol.GetConformer()
+            mol_conf = mol_with_h.GetConformer()
+        except ValueError:
+            # If there's no conformer, we can't proceed with coordinate assignment
+            logging.debug(f"Dataset {dataset_name}: No valid conformer available for {structure_type} coordinate assignment from PDB, using original CIF coordinates")
+            Chem.AssignStereochemistryFrom3D(mol_with_h)
+            return mol_with_h
+        
+        # Assign coordinates by atom index
+        for i in range(mol_with_h.GetNumAtoms()):
+            if i < pdb_mol.GetNumAtoms():
+                try:
+                    pos = pdb_conf.GetAtomPosition(i)
+                    conf.SetAtomPosition(i, pos)
+                except (ValueError, IndexError):
+                    # If we can't get position from PDB, use CIF position
+                    try:
+                        pos = mol_conf.GetAtomPosition(i)
+                        conf.SetAtomPosition(i, pos)
+                    except (ValueError, IndexError):
+                        # Last resort: set to origin
+                        conf.SetAtomPosition(i, Point3D(0.0, 0.0, 0.0))
+            else:
+                # Keep original CIF position for atoms not in PDB
+                try:
+                    pos = mol_conf.GetAtomPosition(i)
+                    conf.SetAtomPosition(i, pos)
+                except (ValueError, IndexError):
+                    # Last resort: set to origin
+                    conf.SetAtomPosition(i, Point3D(0.0, 0.0, 0.0))
+        
+        # Remove existing conformer and add the new one
+        try:
+            mol_with_h.RemoveConformer(0)
+        except ValueError:
+            # No conformer to remove
+            pass
+        mol_with_h.AddConformer(conf)
+    
+    Chem.AssignStereochemistryFrom3D(mol_with_h)
+    return mol_with_h
+
+def compare_chiral_centers_cif_pdb(input_cif, input_pdb, output_cif, output_pdb, smiles_file, dataset_name="Unknown"):
+    """
+    Compare stereochemistry using CIF files for topology and PDB files for coordinates.
+    This matches the approach used in compare_chirality.py.
+    """
+    try:
+        # Load reference SMILES
+        with open(smiles_file, 'r') as f:
+            smiles = f.readline().strip()
+
+        # Process input molecule
+        logging.debug(f"Loading input CIF: {input_cif}")
+        mol_input = load_mol_from_cif(input_cif)
+        logging.debug(f"Assigning coordinates from input PDB: {input_pdb}")
+        mol_input = assign_coordinates_from_pdb(mol_input, input_pdb, dataset_name, "input")
+
+        # Process output molecule - use CIF topology + PDB coordinates
+        logging.debug(f"Loading output CIF: {output_cif}")
+        mol_output = load_mol_from_cif(output_cif)
+        logging.debug(f"Assigning coordinates from output PDB: {output_pdb}")
+        mol_output = assign_coordinates_from_pdb(mol_output, output_pdb, dataset_name, "output")
+
+        # Find chiral centers
+        chiral_input = Chem.FindMolChiralCenters(mol_input, includeUnassigned=True)
+        chiral_output = Chem.FindMolChiralCenters(mol_output, includeUnassigned=True)
+
+        # Generate SMILES without explicit hydrogens - handle potential errors
+        try:
+            mol_input_no_h = Chem.RemoveHs(mol_input)
+            smiles_input = Chem.MolToSmiles(mol_input_no_h, isomericSmiles=True)
+        except Exception as e:
+            logging.warning(f"Failed to generate input SMILES: {e}")
+            smiles_input = "Failed to generate"
+            
+        try:
+            mol_output_no_h = Chem.RemoveHs(mol_output)
+            smiles_output = Chem.MolToSmiles(mol_output_no_h, isomericSmiles=True)
+        except Exception as e:
+            logging.warning(f"Failed to generate output SMILES: {e}")
+            smiles_output = "Failed to generate"
+
+        # Compare chiral centers
+        differences = []
+        input_dict = {idx: config for idx, config in chiral_input}
+        output_dict = {idx: config for idx, config in chiral_output}
+        
+        all_chiral_indices = set(input_dict.keys()) | set(output_dict.keys())
+        
+        for idx in all_chiral_indices:
+            input_config = input_dict.get(idx, 'Not found')
+            output_config = output_dict.get(idx, 'Not found')
+            if input_config != output_config:
+                differences.append(f"Atom {idx}: {input_config} → {output_config}")
+
+        if differences:
+            result = f"Chiral centre inverted:\n{'; '.join(differences)}"
+        else:
+            result = "Output stereochemistry matches input"
+            
+        logging.debug(f"Input chiral centers: {chiral_input}")
+        logging.debug(f"Output chiral centers: {chiral_output}")
+        logging.debug(f"Reference SMILES: {smiles}")
+        logging.debug(f"Input SMILES: {smiles_input}")
+        logging.debug(f"Output SMILES: {smiles_output}")
+        
+        return result, smiles_output
+        
+    except Exception as e:
+        logging.error(f"Error in CIF/PDB chirality comparison: {e}")
+        logging.debug(f"Full traceback: {traceback.format_exc()}")
+        return f"Error: {str(e)}", "NA"
+
+# Column order for consistent output across HTML and JSON
+COLUMN_ORDER = [
+    'Export to XCE',
+    'Comments',
+    'Crystal Name',
+    'Compound Code',
+    'Input Ligand Structure',
+    'Ligand Density',
+    'Chiral inversion',
+    'Pipedream Directory',
+    'Buster Report HTML',
+    'Ligand Report HTML',
+    'Ligand CC',
+    'Ligand occupancy',
+    'Ligand avg B factor',
+    'Mean B factor',
+    'High resolution (A)',
+    'R',
+    'Rfree',
+    'Mogul Z angle',
+    'Mogul Z bond',
+    'c beta deviations',
+    'Rama outlier percent',
+    'Rama favored percent',
+    'Poor rotamer percent',
+    'Clash score',
+    'Mol probity score',
+    'RMS bonds',
+    'RMS angles',
+    'Pipedream Summary',
+    'PDB File',
+    'MTZ File',
+    '2Fo-Fc Map File',
+    'Fo-Fc Map File',
+    'Output SMILES'
+]
+
+def _extract_ligand_from_pdb(mol: Chem.Mol) -> Chem.Mol:
+    """
+    Extract ligand fragment from a PDB molecule that may contain protein + ligand.
+    
+    Args:
+        mol: RDKit molecule object from PDB
+        
+    Returns:
+        Ligand fragment or original molecule if extraction fails
+    """
+    try:
+        frags = Chem.GetMolFrags(mol, asMols=True, sanitizeFrags=False)
+        if len(frags) > 1:
+            # Sort fragments by size and take the smallest (likely the ligand)
+            frags_with_size = [(frag, frag.GetNumAtoms()) for frag in frags]
+            frags_with_size.sort(key=lambda x: x[1])
+            
+            # Take the smallest fragment that's not too small (at least 5 atoms)
+            for frag, size in frags_with_size:
+                if size >= MIN_LIGAND_ATOMS:
+                    logging.debug(f"Extracted ligand fragment with {size} atoms from {len(frags)} fragments")
+                    # Return the fragment without sanitization here - let calling function handle it
+                    return frag
+            
+            logging.warning("Could not identify ligand fragment, using full structure")
+        else:
+            logging.debug(f"Output PDB contains single molecule with {mol.GetNumAtoms()} atoms")
+    except Exception as e:
+        logging.warning(f"Error extracting ligand from PDB, using full structure: {e}")
+    
+    return mol
+
+
+def extract_smiles_from_pdb(output_pdb_path: str, pipedream_dir: str = 'NA', compound_code: str = 'NA') -> str:
+    """
+    Extract SMILES string from the ligand in an output PDB file.
+    Preferentially uses CIF file for bond order information if available.
+    
+    Args:
+        output_pdb_path: Path to the output PDB file containing the ligand
+        pipedream_dir: Pipedream directory path for finding CIF files
+        compound_code: Compound code for finding CIF files
+        
+    Returns:
+        SMILES string of the ligand, or error message if extraction fails
+    """
+    if not os.path.isfile(output_pdb_path):
+        return f"PDB file not found: {output_pdb_path}"
+    
+    try:
+        # First try to use CIF file if available for better bond order information
+        cif_mol = None
+        if pipedream_dir != 'NA' and compound_code != 'NA':
+            cif_dir = os.path.join(pipedream_dir, f"rhofit-{compound_code}")
+            cif_path = os.path.join(cif_dir, "best.cif")
+            
+            if os.path.isfile(cif_path):
+                logging.debug(f"Found CIF file: {cif_path}")
+                try:
+                    # Try different methods to read CIF file
+                    cif_mol = None
+                    
+                    # First try: Standard CIF file reader
+                    try:
+                        cif_mol = Chem.MolFromMolFile(cif_path, removeHs=False)
+                    except:
+                        pass
+                    
+                    # Second try: Read as text and parse as PDB block if standard fails
+                    if cif_mol is None:
+                        with open(cif_path, 'r') as f:
+                            cif_content = f.read()
+                        # Try to extract PDB-like coordinate block from CIF
+                        # This is a fallback that may work for some CIF files
+                        if 'LIG' in cif_content and '_chem_comp_atom' in cif_content:
+                            logging.debug(f"CIF file contains ligand data, attempting extraction")
+                            # For now, skip complex CIF parsing and use PDB fallback
+                            cif_mol = None
+                    
+                    if cif_mol is not None:
+                        logging.debug(f"Successfully loaded molecule from CIF with {cif_mol.GetNumAtoms()} atoms")
+                        # CIF files typically have correct bond orders, so minimal sanitization needed
+                        try:
+                            Chem.SanitizeMol(cif_mol)
+                        except Exception as e:
+                            logging.warning(f"CIF sanitization failed: {e}")
+                            cif_mol = None
+                    else:
+                        logging.warning(f"Failed to parse CIF file: {cif_path}")
+                except Exception as e:
+                    logging.warning(f"Error reading CIF file {cif_path}: {e}")
+        
+        # If CIF worked, use it; otherwise fall back to PDB
+        if cif_mol is not None:
+            ligand_mol = cif_mol
+            logging.debug("Using CIF file for SMILES generation")
+        else:
+            logging.debug("Falling back to PDB file for SMILES generation")
+            # Read the PDB file
+            mol = Chem.MolFromPDBFile(output_pdb_path, removeHs=False)
+            if mol is None:
+                return f"Failed to parse PDB file: {output_pdb_path}"
+            
+            # Extract only the ligand from the PDB
+            ligand_mol = _extract_ligand_from_pdb(mol)
+            
+            # Critical: Sanitize the molecule to correct bond orders and formal charges
+            # This is essential when reading from PDB files where bond orders may be incorrect
+            try:
+                Chem.SanitizeMol(ligand_mol)
+            except Exception as e:
+                logging.warning(f"Sanitization failed for PDB ligand, trying alternative approach: {e}")
+                # Try to fix common PDB issues
+                try:
+                    ligand_mol = Chem.AddHs(ligand_mol)
+                    Chem.SanitizeMol(ligand_mol)
+                    ligand_mol = Chem.RemoveHs(ligand_mol)
+                except Exception as e2:
+                    logging.warning(f"Alternative sanitization also failed: {e2}")
+        
+        # Remove hydrogens before generating SMILES
+        ligand_mol = Chem.RemoveHs(ligand_mol)
+        
+        # Assign stereochemistry with careful handling
+        Chem.AssignStereochemistry(ligand_mol, force=True, cleanIt=True)
+        
+        # Generate SMILES with stereochemistry (hydrogens excluded)
+        # Use canonical SMILES to ensure consistency
+        smiles = Chem.MolToSmiles(ligand_mol, isomericSmiles=True, canonical=True)
+        
+        if not smiles:
+            return "Failed to generate SMILES from ligand"
+        
+        logging.debug(f"Generated SMILES from {'CIF' if cif_mol is not None else 'PDB'}: {smiles}")
+        return smiles
+        
+    except Exception as e:
+        logging.error(f"Error extracting SMILES from structure files: {e}")
+        return f"Error extracting SMILES: {e}"
+
+
+
+def save_output_smiles_with_analysis(output_mol, compound_code, pipedream_dir, chirality_result="Not analyzed", input_smiles=""):
+    """
+    Save output SMILES with chirality analysis results to the specific pipedream run directory.
+    Uses timestamp to avoid overwriting existing files.
+    
+    Args:
+        output_mol: RDKit molecule object from output structure
+        compound_code: Compound identifier
+        pipedream_dir: Pipedream run directory to save file
+        chirality_result: Result of chirality analysis
+        input_smiles: Original input SMILES for comparison
+    
+    Returns:
+        Path to saved file or error message
+    """
+    try:
+        # Remove hydrogens and assign stereochemistry
+        mol_no_h = Chem.RemoveHs(output_mol)
+        Chem.AssignStereochemistry(mol_no_h, force=True, cleanIt=True)
+        # Generate canonical isomeric SMILES
+        output_smiles = Chem.MolToSmiles(mol_no_h, isomericSmiles=True, canonical=True)
+        
+        # Create simple filename
+        smiles_filename = f"{compound_code}_output_smiles.smiles"
+        output_path = os.path.join(pipedream_dir, smiles_filename)
+            
+        # Write file with comprehensive metadata
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(f"# Output SMILES analysis for compound {compound_code}\n")
+            f.write(f"# Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"# Chirality analysis: {chirality_result}\n")
+            if input_smiles:
+                f.write(f"# Input SMILES:  {input_smiles}\n")
+            f.write(f"# Output SMILES: {output_smiles}\n")
+            f.write(f"#\n")
+            f.write(f"# SMILES string:\n")
+            f.write(f"{output_smiles}\n")
+            
+        logging.debug(f"Saved output SMILES analysis to: {output_path}")
+        return output_path
+    except Exception as e:
+        logging.error(f"Error saving output SMILES for {compound_code}: {e}")
+        return f"Error saving output SMILES: {e}"
+
+def detect_chiral_inversion(input_smi_path: str, output_pdb_path: str, input_pdb_path: Optional[str] = None, pipedream_dir: str = 'NA', compound_code: str = 'NA') -> Tuple[str, str]:
+    """
+    Detect chirality differences between input and output structures.
+    Uses input SMILES (or optionally input PDB) and output PDB files.
+    
+    Args:
+        input_smi_path: Path to input SMILES file
+        output_pdb_path: Path to output PDB file
+        input_pdb_path: Optional path to input PDB file (preferred over SMILES)
+        pipedream_dir: Pipedream directory path for saving canonical SMILES output files
+        compound_code: Compound code used for naming output SMILES files
+    
+    Returns:
+        Tuple of (chirality comparison result, updated SMILES from output structure)
+    """
+    # File existence checks
+    if not os.path.isfile(input_smi_path):
+        return f"Input SMILES not found: {input_smi_path}", "NA"
+    if not os.path.isfile(output_pdb_path):
+        return f"Output PDB not found: {output_pdb_path}", "NA"
+
+    try:
+        # Try to use input PDB if available, otherwise fall back to SMILES
+        if input_pdb_path and os.path.isfile(input_pdb_path):
+            logging.debug(f"Using input PDB for comparison: {input_pdb_path}")
+            input_mol = Chem.MolFromPDBFile(input_pdb_path, removeHs=False)
+            if input_mol is None:
+                logging.warning(f"Failed to parse input PDB, falling back to SMILES")
+                input_mol = None
+            else:
+                Chem.AssignStereochemistry(input_mol, force=True, cleanIt=True)
+                source = "PDB"
+        
+        # Fall back to SMILES if PDB not available or failed
+        if input_mol is None:
+            logging.debug(f"Using input SMILES for comparison: {input_smi_path}")
+            with open(input_smi_path, 'r', encoding='utf-8') as f:
+                smiles_line = f.readline().strip()
+            smiles = smiles_line.split()[0] if smiles_line else ""
+            if not smiles:
+                return f"Empty or invalid SMILES file: {input_smi_path}", "NA"
+
+            logging.debug(f"Processing SMILES: {smiles}")
+            input_mol = Chem.MolFromSmiles(smiles)
+            if input_mol is None:
+                return f"Failed to parse SMILES: {smiles}", "NA"
+            source = "SMILES"
+
+        # Read output structure from PDB file
+        logging.debug(f"Reading output structure from PDB file: {output_pdb_path}")
+        output_mol = Chem.MolFromPDBFile(output_pdb_path, removeHs=False)
+        if output_mol is None:
+            return f"Failed to parse output PDB file: {output_pdb_path}", "NA"
+
+        # Extract only the ligand from the output PDB
+        output_mol = _extract_ligand_from_pdb(output_mol)
+        
+        # CRITICAL: Use input SMILES as template to preserve bond orders
+        # PDB files lack bond order information, so we use the input structure as a template
+        template_mol = None
+        try:
+            # Get the input SMILES string to use as template
+            if source == "SMILES":
+                # We already have the input molecule from SMILES
+                template_mol = input_mol
+                logging.debug("Using input SMILES molecule as template for bond order assignment")
+            else:
+                # If input was from PDB, try to get SMILES from the original SMILES file
+                logging.debug(f"Reading SMILES template from: {input_smi_path}")
+                with open(input_smi_path, 'r', encoding='utf-8') as f:
+                    smiles_line = f.readline().strip()
+                template_smiles = smiles_line.split()[0] if smiles_line else ""
+                if template_smiles:
+                    template_mol = Chem.MolFromSmiles(template_smiles)
+                    logging.debug(f"Using SMILES template: {template_smiles}")
+                
+            if template_mol is not None:
+                # Use template to assign correct bond orders to output molecule
+                
+                # Remove hydrogens from both molecules for template matching
+                template_no_h = Chem.RemoveHs(template_mol)
+                output_no_h = Chem.RemoveHs(output_mol)
+                
+                # Assign bond orders from template - this preserves the correct connectivity
+                output_mol_corrected = AllChem.AssignBondOrdersFromTemplate(template_no_h, output_no_h)
+                
+                if output_mol_corrected is not None:
+                    output_mol = output_mol_corrected
+                    logging.debug("Successfully assigned bond orders using input SMILES template")
+                else:
+                    logging.warning("Failed to assign bond orders from template, using standard sanitization")
+                    raise Exception("Template assignment failed")
+            else:
+                raise Exception("No template molecule available")
+                
+        except Exception as e:
+            logging.warning(f"Could not use template for bond order assignment: {e}, falling back to standard sanitization")
+            # Fallback to standard sanitization if template approach fails
+            try:
+                Chem.SanitizeMol(output_mol)
+            except Exception as e2:
+                logging.warning(f"Standard sanitization failed: {e2}, trying alternative approach")
+                try:
+                    output_mol = Chem.AddHs(output_mol)
+                    Chem.SanitizeMol(output_mol)
+                    output_mol = Chem.RemoveHs(output_mol)
+                except Exception as e3:
+                    logging.warning(f"Alternative sanitization also failed: {e3}")
+        
+        # Now assign stereochemistry with correct bond orders
+        Chem.AssignStereochemistry(output_mol, force=True, cleanIt=True)
+        
+        # Generate SMILES from output ligand (exclude hydrogens)
+        output_mol_no_h = Chem.RemoveHs(output_mol)
+        
+        # Get input SMILES for comparison metadata
+        input_smiles_for_metadata = ""
+        if source == "SMILES":
+            input_smiles_for_metadata = smiles
+        else:
+            # Try to read from SMILES file for metadata
+            try:
+                with open(input_smi_path, 'r', encoding='utf-8') as f:
+                    input_smiles_for_metadata = f.readline().strip().split()[0]
+            except:
+                pass
+        
+        updated_smiles = Chem.MolToSmiles(output_mol_no_h, isomericSmiles=True, canonical=True)
+        if not updated_smiles:
+            updated_smiles = "Failed to generate SMILES"
+
+        # Find chiral centers
+        input_chiral_centers = _get_chiral_centers(input_mol)
+        output_chiral_centers = _get_chiral_centers(output_mol)
+        
+        logging.debug(f"Input chiral centers: {len(input_chiral_centers)}")
+        logging.debug(f"Output chiral centers: {len(output_chiral_centers)}")
+
+        # Additional molecular information
+        input_atoms = input_mol.GetNumAtoms()
+        output_atoms = output_mol.GetNumAtoms()
+        
+        logging.debug(f"Input ligand ({source}): {input_atoms} atoms")
+        logging.debug(f"Output ligand (PDB): {output_atoms} atoms")
+        
+        # For both PDB and SMILES inputs, we need to handle atom mapping since 
+        # atom indices don't correspond between input and output structures        
+        try:
+            # Align molecules and map chiral centers
+            mapped_output_chiral = _align_molecules_and_map_chiral_centers(
+                input_mol, output_mol, input_chiral_centers, output_chiral_centers, source
+            )
+            
+            # Compare mapped chirality
+            input_dict = {idx: config for idx, config in input_chiral_centers}
+            output_dict = mapped_output_chiral
+                
+        except Exception as e:
+            return f"Error during structural alignment: {e}", updated_smiles
+
+        # Check for differences in chiral centers
+        differences = []
+        for atom_idx in input_dict:
+            if atom_idx in output_dict:
+                if output_dict[atom_idx] is None:
+                    differences.append(f"Atom {atom_idx}: {input_dict[atom_idx]} -> missing")
+                elif input_dict[atom_idx] != output_dict[atom_idx]:
+                    differences.append(f"Atom {atom_idx}: {input_dict[atom_idx]} -> {output_dict[atom_idx]}")
+            else:
+                differences.append(f"Atom {atom_idx}: {input_dict[atom_idx]} -> missing")
+
+        if differences:
+            result = "Chiral centre inverted: " + "; ".join(differences)
+            logging.debug(f"Chirality comparison complete: {result}")
+            logging.debug(f"Input source: {source}, Output source: PDB")
+        else:
+            result = "Stereochemistry matches input"
+            logging.debug(f"Chirality comparison complete: {result}")
+            logging.debug(f"Input source: {source}, Output source: PDB")
+            # If no differences, don't provide updated SMILES
+            updated_smiles = "NA"
+        
+        # Save comprehensive SMILES analysis file
+        smiles_file_path = "NA"
+        if pipedream_dir != 'NA' and compound_code != 'NA':
+            smiles_file_path = save_output_smiles_with_analysis(
+                output_mol, compound_code, pipedream_dir, result, input_smiles_for_metadata
+            )
+            if not smiles_file_path.startswith("Error"):
+                logging.debug(f"Output SMILES analysis saved to: {smiles_file_path}")
+        
+        return result, updated_smiles
+
+    except Exception as e:
+        logging.error(f"Error during chirality comparison for {input_smi_path} -> {output_pdb_path}: {e}")
+        return f"Error during chirality comparison: {e}", "NA"
+
+
+def _get_chiral_centers(mol: Chem.Mol) -> List[Tuple[int, str]]:
+    """
+    Get all chiral centers from a molecule, including genuinely unassigned ones.
+    
+    Args:
+        mol: RDKit molecule object
+        
+    Returns:
+        List of (atom_index, configuration) tuples
+    """
+    # Get assigned chiral centers
+    chiral_centers = Chem.FindMolChiralCenters(mol, includeUnassigned=False)
+    
+    # Get all potential chiral centers (including unassigned)
+    all_chiral = Chem.FindMolChiralCenters(mol, includeUnassigned=True)
+    
+    # Add genuinely unassigned chiral centers (exclude false positives)
+    assigned_indices = {idx for idx, _ in chiral_centers}
+    
+    for idx, config in all_chiral:
+        if config == '?' and idx not in assigned_indices:
+            # Verify this is actually a chiral center
+            atom = mol.GetAtomWithIdx(idx)
+            if atom.GetDegree() == 4 and len(set(n.GetSymbol() for n in atom.GetNeighbors())) >= 3:
+                chiral_centers.append((idx, config))
+    
+    return chiral_centers
+
+
+def _align_molecules_and_map_chiral_centers(input_mol: Chem.Mol, output_mol: Chem.Mol, 
+                                          input_chiral_centers: List[Tuple[int, str]], 
+                                          output_chiral_centers: List[Tuple[int, str]], 
+                                          source: str) -> Dict[int, Optional[str]]:
+    """
+    Align molecules using MCS and map chiral centers from input to output.
+    
+    Args:
+        input_mol: Input molecule
+        output_mol: Output molecule  
+        input_chiral_centers: Input chiral centers
+        output_chiral_centers: Output chiral centers
+        source: Source type ("PDB" or "SMILES")
+        
+    Returns:
+        Dictionary mapping input atom indices to output configurations
+    """
+    from rdkit.Chem import rdFMCS
+    
+    # Find maximum common substructure to establish atom mapping
+    mcs = rdFMCS.FindMCS([input_mol, output_mol], 
+                       bondCompare=rdFMCS.BondCompare.CompareOrderExact,
+                       atomCompare=rdFMCS.AtomCompare.CompareElements,
+                       timeout=MCS_TIMEOUT_SECONDS)
+    
+    if mcs.numAtoms <= MIN_MCS_ATOMS:
+        raise ValueError(f"Insufficient structural similarity for mapping (MCS: {mcs.numAtoms} atoms)")
+    
+    # Get the match mapping
+    mcs_mol = Chem.MolFromSmarts(mcs.smartsString)
+    input_match = input_mol.GetSubstructMatch(mcs_mol)
+    output_match = output_mol.GetSubstructMatch(mcs_mol)
+    
+    if not input_match or not output_match:
+        raise ValueError("Could not establish atom mapping between structures (no substructure match)")
+    
+    # Create mapping from input to output atom indices
+    atom_mapping = dict(zip(input_match, output_match))
+    
+    # Map input chiral centers to output using the mapping
+    mapped_output_chiral = {}
+    for input_idx, config in input_chiral_centers:
+        if input_idx in atom_mapping:
+            output_idx = atom_mapping[input_idx]
+            # Find the corresponding output chiral center
+            for out_idx, out_config in output_chiral_centers:
+                if out_idx == output_idx:
+                    mapped_output_chiral[input_idx] = out_config
+                    break
+            else:
+                mapped_output_chiral[input_idx] = None  # Lost chirality
+    
+    logging.debug(f"Successfully mapped {len(atom_mapping)} atoms via MCS ({source} input)")
+    logging.debug(f"Input chiral centers: {input_chiral_centers}")
+    logging.debug(f"Mapped output chiral: {mapped_output_chiral}")
+    
+    return mapped_output_chiral
 
 
 def read_json(json_file: str) -> dict:
     """Read a JSON file and return its contents as a dictionary."""
     try:
-        with open(json_file, 'r') as file:
+        with open(json_file, 'r', encoding='utf-8') as file:
             data = json.load(file)
-            logging.info("JSON file read successfully.")
             return data
     except Exception as e:
         logging.error(f"Error reading JSON file: {e}")
@@ -24,7 +798,7 @@ def read_json(json_file: str) -> dict:
 
 def validate_json_structure(json_data: dict) -> None:
     """Warn if required keys are missing in any dataset info."""
-    required_keys = ['ExpectedSummary', 'LigandPNG']
+    required_keys = ['ExpectedSummary']
     for dataset, info in json_data.items():
         for key in required_keys:
             if key not in info:
@@ -51,16 +825,94 @@ def safe_round(value: Any, digits: int = 3) -> Any:
         return 'NA'
 
 
+def safe_dict_get(stats: Optional[dict], key: str, default: Any = 'NA') -> Any:
+    """Safely get a value from a dictionary, returning default if dict is None or key missing."""
+    return stats.get(key, default) if isinstance(stats, dict) else default
+
+
+def get_file_link_html(cell_val: str) -> str:
+    """Generate HTML for file links with appropriate data attributes."""
+    if not cell_val or cell_val == 'NA':
+        return '<td></td>'
+    
+    file_ext = os.path.splitext(cell_val)[1].lower()
+    file_name = os.path.basename(cell_val)
+    return f'<td><a href="#" class="file-link" data-file="file://{cell_val}" data-ext="{file_ext}">{file_name}</a></td>'
+
+
+def get_ligand_png_path(input_dir: str, compound_code: str) -> str:
+    """Construct the path to the ligand diagram SVG file from input directory and compound code."""
+    if input_dir == 'NA' or compound_code == 'NA':
+        return 'NA'
+    
+    svg_path = os.path.join(input_dir, f"{compound_code}.diagram.svg")
+    return svg_path if os.path.isfile(svg_path) else 'NA'
+
+
+def build_file_path(base_dir: str, relative_path: str, filename: str) -> str:
+    """Build a complete file path from components, handling empty values gracefully."""
+    if base_dir == 'NA':
+        return 'NA'
+    return os.path.join(base_dir, relative_path or '', filename or '')
+
+
 def convert_mtz_to_map(mtz_file_path: str, map_type: str = '2fofc') -> str:
     """Convert an MTZ file to a map file using gemmi, if not already present."""
+    if mtz_file_path == 'NA':
+        logging.debug("MTZ file path is 'NA', skipping map conversion")
+        return 'NA'
+        
     map_file_path = mtz_file_path.replace('.mtz', f'_{map_type}.map')
+    logging.debug(f"Attempting to convert MTZ to {map_type} map: {mtz_file_path} -> {map_file_path}")
+    
     if os.path.exists(map_file_path):
+        logging.debug(f"Map file already exists: {map_file_path}")
         return map_file_path
-    if map_type == '2fofc':
-        subprocess.run(['gemmi', 'sf2map', mtz_file_path, map_file_path])
-    elif map_type == 'fofc':
-        subprocess.run(['gemmi', 'sf2map', mtz_file_path, '-d', map_file_path])
-    return map_file_path
+    
+    if not os.path.exists(mtz_file_path):
+        logging.warning(f"MTZ file not found: {mtz_file_path}")
+        return 'NA'
+    
+    # Check if gemmi is available before attempting conversion
+    gemmi_available, gemmi_cmd = check_gemmi_availability()
+    
+    if not gemmi_available:
+        logging.warning("gemmi command not available. Map file conversion skipped.")
+        return 'NA'
+    
+    try:
+        logging.debug(f"Converting MTZ to {map_type} map: {mtz_file_path}")
+        if map_type == '2fofc':
+            cmd = gemmi_cmd + ['sf2map', mtz_file_path, map_file_path]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        elif map_type == 'fofc':
+            cmd = gemmi_cmd + ['sf2map', mtz_file_path, '-d', map_file_path]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        else:
+            logging.error(f"Unknown map type: {map_type}")
+            return 'NA'
+        
+        logging.debug(f"gemmi command: {' '.join(cmd)}")
+        logging.debug(f"gemmi stdout: {result.stdout}")
+        logging.debug(f"gemmi stderr: {result.stderr}")
+        
+        if result.returncode == 0:
+            if os.path.exists(map_file_path):
+                logging.info(f"Successfully created map file: {map_file_path}")
+                return map_file_path
+            else:
+                logging.error(f"gemmi command succeeded but map file not created: {map_file_path}")
+                return 'NA'
+        else:
+            logging.error(f"Error creating map file (return code {result.returncode}): {result.stderr}")
+            return 'NA'
+            
+    except subprocess.TimeoutExpired:
+        logging.error(f"Timeout converting MTZ to map: {mtz_file_path}")
+        return 'NA'
+    except Exception as e:
+        logging.error(f"Error converting MTZ to map: {e}")
+        return 'NA'
 
 
 def build_result(
@@ -72,18 +924,25 @@ def build_result(
     postrefinement_stats: Optional[dict] = None,
     electron_density_gif: str = 'NA',
     chirality_flip: str = 'Not checked',
+    updated_smiles_file: str = 'NA',
     pdb_file: str = 'NA',
     mtz_file: str = 'NA',
     map_2fofc_file: str = 'NA',
-    map_fofc_file: str = 'NA'
+    map_fofc_file: str = 'NA',
+    high_resolution: str = 'NA'
 ) -> Dict[str, Any]:
     """Build a result dictionary for a dataset."""
+    # Construct ligand SVG diagram path from Input_dir and CompoundCode
+    input_dir = info.get('Input_dir', 'NA')
+    compound_code = info.get('CompoundCode', 'NA')
+    ligand_png = get_ligand_png_path(input_dir, compound_code)
+    
     return {
         'Crystal Name': dataset,
-        'Compound Code': info.get('CompoundCode', 'NA'),
-        'Ligand Structure': info.get('LigandPNG', 'NA'),
+        'Compound Code': compound_code,
+        'Input Ligand Structure': ligand_png,
         'Ligand Density': electron_density_gif,
-        'Chirality Flips': chirality_flip,
+        'Chiral inversion': chirality_flip,
         'Pipedream Directory': info.get('PipedreamDirectory', 'NA'),
         'Buster Report HTML': info.get('ReportHTML', 'NA'),
         'Ligand Report HTML': info.get('LigandReportHTML', 'NA'),
@@ -92,62 +951,162 @@ def build_result(
         'MTZ File': mtz_file,
         '2Fo-Fc Map File': map_2fofc_file,
         'Fo-Fc Map File': map_fofc_file,
-        'Ligand ID': ligand_stats.get('ligandid', 'NA') if isinstance(ligand_stats, dict) else 'NA',
-        'Ligand CC': ligand_stats.get('ligandcc', 'NA') if isinstance(ligand_stats, dict) else 'NA',
-        'R': safe_round(postrefinement_stats.get('R')) if isinstance(postrefinement_stats, dict) else 'NA',
-        'Rfree': safe_round(postrefinement_stats.get('Rfree')) if isinstance(postrefinement_stats, dict) else 'NA',
-        'Ligand avg B factor': ligand_stats.get('ligandbavg', 'NA') if isinstance(ligand_stats, dict) else 'NA',
-        'Ligand occupancy': ligand_stats.get('ligandomin', 'NA') if isinstance(ligand_stats, dict) else 'NA',
-        'Mogul Z angle': ligand_stats.get('mogulzangl', 'NA') if isinstance(ligand_stats, dict) else 'NA',
-        'Mogul Z bond': ligand_stats.get('mogulzbond', 'NA') if isinstance(ligand_stats, dict) else 'NA',
-        'c beta deviations': molprobity_stats.get('cbetadeviations', 'NA') if isinstance(molprobity_stats, dict) else 'NA',
-        'Rama outlier percent': molprobity_stats.get('ramaoutlierpercent', 'NA') if isinstance(molprobity_stats, dict) else 'NA',
-        'Rama favored percent': molprobity_stats.get('ramafavoredpercent', 'NA') if isinstance(molprobity_stats, dict) else 'NA',
-        'Poor rotamer percent': molprobity_stats.get('poorrotamerspercent', 'NA') if isinstance(molprobity_stats, dict) else 'NA',
-        'Clash score': molprobity_stats.get('clashscore', 'NA') if isinstance(molprobity_stats, dict) else 'NA',
-        'Mol probity score': molprobity_stats.get('molprobityscore', 'NA') if isinstance(molprobity_stats, dict) else 'NA',
-        'RMS bonds': molprobity_stats.get('rmsbonds', 'NA') if isinstance(molprobity_stats, dict) else 'NA',
-        'RMS angles': molprobity_stats.get('rmsangles', 'NA') if isinstance(molprobity_stats, dict) else 'NA',
-        'Mean B factor': postrefinement_stats.get('MeanB', 'NA') if isinstance(postrefinement_stats, dict) else 'NA',
+        'Output SMILES': updated_smiles_file,
+        'Ligand ID': safe_dict_get(ligand_stats, 'ligandid'),
+        'Ligand CC': safe_dict_get(ligand_stats, 'ligandcc'),
+        'R': safe_round(safe_dict_get(postrefinement_stats, 'R')),
+        'Rfree': safe_round(safe_dict_get(postrefinement_stats, 'Rfree')),
+        'Ligand avg B factor': safe_dict_get(ligand_stats, 'ligandbavg'),
+        'Ligand occupancy': safe_dict_get(ligand_stats, 'ligandomin'),
+        'Mogul Z angle': safe_dict_get(ligand_stats, 'mogulzangl'),
+        'Mogul Z bond': safe_dict_get(ligand_stats, 'mogulzbond'),
+        'c beta deviations': safe_dict_get(molprobity_stats, 'cbetadeviations'),
+        'Rama outlier percent': safe_dict_get(molprobity_stats, 'ramaoutlierpercent'),
+        'Rama favored percent': safe_dict_get(molprobity_stats, 'ramafavoredpercent'),
+        'Poor rotamer percent': safe_dict_get(molprobity_stats, 'poorrotamerspercent'),
+        'Clash score': safe_dict_get(molprobity_stats, 'clashscore'),
+        'Mol probity score': safe_dict_get(molprobity_stats, 'molprobityscore'),
+        'RMS bonds': safe_dict_get(molprobity_stats, 'rmsbonds'),
+        'RMS angles': safe_dict_get(molprobity_stats, 'rmsangles'),
+        'Mean B factor': safe_dict_get(postrefinement_stats, 'MeanB'),
+        'High resolution (A)': high_resolution,
         'Comments': '',
-        'Export to XCE': 'True' if (isinstance(ligand_stats, dict) and ligand_stats.get('ligandcc', 0) > 0.8) else 'False'
+        'Export to XCE': 'True' if (isinstance(ligand_stats, dict) and ligand_stats.get('ligandcc', 0) > LIGAND_CC_THRESHOLD) else 'False'
     }
 
 
 def collect_results_from_json(json_data: dict) -> List[Dict[str, Any]]:
     """Collect results from the JSON data for all datasets."""
     results = []
-    for dataset, info in json_data.items():
+    total_datasets = len(json_data)
+    logging.info(f"Processing {total_datasets} datasets")
+    print(f"Processing {total_datasets} datasets...")  # Console progress
+    
+    for i, (dataset, info) in enumerate(json_data.items(), 1):
+        logging.info(f"Processing dataset {i}/{total_datasets}: {dataset}")
+        
+        # Show progress every 10 datasets or at start/end
+        if i % 10 == 0 or i == 1 or i == total_datasets:
+            print(f"Progress: {i}/{total_datasets} datasets processed")
+        
         summary_file = info.get('ExpectedSummary', 'NA')
+        
         if not os.path.exists(summary_file):
             logging.warning(f"Summary file not found for {dataset}: {summary_file}")
-            results.append(build_result(dataset, info, summary_file))
+            results.append(build_result(dataset, info, summary_file, updated_smiles_file="NA"))
             continue
         try:
-            with open(summary_file, 'r') as f:
+            with open(summary_file, 'r', encoding='utf-8') as f:
                 summary = json.load(f)
+            logging.debug(f"Successfully loaded summary for {dataset}")
         except json.JSONDecodeError as e:
             logging.error(f"Error decoding JSON in {summary_file} for dataset {dataset}: {e}")
-            results.append(build_result(dataset, info, summary_file))
+            results.append(build_result(dataset, info, summary_file, updated_smiles_file="NA"))
             continue
+        
+        # Extract high resolution from dataprocessing.inputdata.reshigh
+        high_resolution = safe_get(summary, ['dataprocessing', 'inputdata', 'reshigh'], 'NA')
+        if high_resolution != 'NA':
+            try:
+                high_resolution = f"{float(high_resolution):.2f}"
+            except (ValueError, TypeError):
+                high_resolution = 'NA'
         ligand = safe_get(summary, ['ligandfitting', 'ligands', 0])
         ligand_stats = safe_get(ligand, ['validationstatistics', 'ligandstatistics', 0])
         molprobity_stats = safe_get(ligand, ['validationstatistics', 'molprobity'])
         postrefinement_stats = safe_get(ligand, ['postrefinement', 1])
-        # Extract PDB and MTZ file paths
+        # Extract PDB, MTZ, and CIF file paths
         pdb_file = 'NA'
         mtz_file = 'NA'
+        input_cif_file = 'NA'
+        output_cif_file = 'NA'
+        
+        pipedream_dir = info.get('PipedreamDirectory', 'NA')
+        compound_code = info.get('CompoundCode', 'NA')
+        
+        # Primary method: Use direct path construction for output files
+        if pipedream_dir != 'NA' and compound_code != 'NA':
+            rhofit_dir = os.path.join(pipedream_dir, f"rhofit-{compound_code}")
+            
+            # Check for output PDB and CIF files in rhofit directory
+            potential_output_pdb = os.path.join(rhofit_dir, "best.pdb")  # For chirality analysis
+            potential_refine_pdb = os.path.join(rhofit_dir, "refine.pdb")  # For display
+            potential_output_cif = os.path.join(rhofit_dir, "best.cif")
+            
+            # Use refine.pdb for the PDB File column (display purposes)
+            if os.path.isfile(potential_refine_pdb):
+                pdb_file = potential_refine_pdb
+                logging.debug(f"Found display PDB via direct path: {pdb_file}")
+            
+            if os.path.isfile(potential_output_cif):
+                output_cif_file = potential_output_cif
+                logging.debug(f"Found output CIF via direct path: {output_cif_file}")
+        
+        # Fallback method: Parse JSON postrefinement section if direct paths didn't work
+        if pdb_file == 'NA' or output_cif_file == 'NA':
+            logging.debug(f"Using fallback JSON parsing for missing files (PDB: {pdb_file}, CIF: {output_cif_file})")
+            postrefinement = safe_get(summary, ['pipedream_outputs', 'ligandfitting', 'ligands', 0, 'postrefinement'], [])
+            if isinstance(postrefinement, list):
+                logging.debug(f"Found {len(postrefinement)} postrefinement entries")
+                for entry in postrefinement:
+                    if entry.get('description') == 'final':
+                        if entry.get('type') == 'model' and entry.get('format') == 'PDB' and pdb_file == 'NA':
+                            pdb_file = build_file_path(
+                                info.get('PipedreamDirectory', 'NA'),
+                                entry.get('relative_path', ''),
+                                entry.get('filename', '')
+                            )
+                            logging.debug(f"Found PDB file via JSON: {pdb_file}")
+                        elif entry.get('type') == 'model' and entry.get('format') == 'CIF' and output_cif_file == 'NA':
+                            output_cif_file = build_file_path(
+                                info.get('PipedreamDirectory', 'NA'),
+                                entry.get('relative_path', ''),
+                                entry.get('filename', '')
+                            )
+                            logging.debug(f"Found output CIF file via JSON: {output_cif_file}")
+                    elif entry.get('description') == 'input':
+                        if entry.get('type') == 'model' and entry.get('format') == 'CIF':
+                            input_cif_file = build_file_path(
+                                info.get('PipedreamDirectory', 'NA'),
+                                entry.get('relative_path', ''),
+                                entry.get('filename', '')
+                            )
+                            logging.debug(f"Found input CIF file via JSON: {input_cif_file}")
+            else:
+                logging.debug(f"No postrefinement entries found or not a list: {type(postrefinement)}")
+        
+        # Always try to find MTZ file from JSON since it's not in the rhofit directory
         postrefinement = safe_get(summary, ['pipedream_outputs', 'ligandfitting', 'ligands', 0, 'postrefinement'], [])
         if isinstance(postrefinement, list):
             for entry in postrefinement:
-                if entry.get('description') == 'final':
-                    if entry.get('type') == 'model' and entry.get('format') == 'PDB':
-                        pdb_file = os.path.join(info.get('PipedreamDirectory', 'NA'), entry.get('relative_path', ''), entry.get('filename', ''))
-                    elif entry.get('type') == 'map' and entry.get('format') == 'MTZ':
-                        mtz_file = os.path.join(info.get('PipedreamDirectory', 'NA'), entry.get('relative_path', ''), entry.get('filename', ''))
+                if entry.get('description') == 'final' and entry.get('type') == 'map' and entry.get('format') == 'MTZ':
+                    mtz_file = build_file_path(
+                        info.get('PipedreamDirectory', 'NA'),
+                        entry.get('relative_path', ''),
+                        entry.get('filename', '')
+                    )
+                    logging.debug(f"Found MTZ file: {mtz_file}")
+                    break
+        
         # Generate map files if MTZ file is valid
-        map_2fofc_file = convert_mtz_to_map(mtz_file, '2fofc') if mtz_file != 'NA' else 'NA'
-        map_fofc_file = convert_mtz_to_map(mtz_file, 'fofc') if mtz_file != 'NA' else 'NA'
+        logging.debug(f"Attempting map generation for MTZ file: {mtz_file}")
+        
+        # Check if gemmi is available first
+        gemmi_available, gemmi_cmd = check_gemmi_availability()
+        
+        if gemmi_available and mtz_file != 'NA':
+            logging.debug(f"gemmi is available, proceeding with map generation for {mtz_file}")
+            map_2fofc_file = convert_mtz_to_map(mtz_file, '2fofc')
+            map_fofc_file = convert_mtz_to_map(mtz_file, 'fofc')
+            logging.debug(f"Map generation results: 2fofc={map_2fofc_file}, fofc={map_fofc_file}")
+        else:
+            map_2fofc_file = 'NA'
+            map_fofc_file = 'NA'
+            if not gemmi_available:
+                logging.debug("gemmi not available, skipping map generation")
+            else:
+                logging.debug("No MTZ file available, skipping map generation")
+        
         # Find electron density movie gif
         electron_density_gif = 'NA'
         pipedream_dir = info.get('PipedreamDirectory', 'NA')
@@ -159,148 +1118,245 @@ def collect_results_from_json(json_data: dict) -> List[Dict[str, Any]]:
                     if fname.endswith('electrondensity_movie.gif'):
                         electron_density_gif = os.path.join(gif_dir, fname)
                         break
-        # Chirality flip detection
-        crystal_name = dataset
-        input_cif = os.path.join(crystal_name, 'input_files', f'{compound_code}.cif')
-        output_cif = os.path.join(pipedream_dir, f'rhofit-{compound_code}', 'best.cif')
-        chirality_flip = 'Not checked'
-        if os.path.isfile(input_cif) and os.path.isfile(output_cif):
-            flips = flag_chirality_flips(input_cif, output_cif)
-            if flips:
-                chirality_flip = '; '.join([f"{center}: {sign_in}->{sign_out}" for center, sign_in, sign_out in flips])
+        
+        # Chirality flip detection - use compound_code or fallback to dataset
+        if compound_code == 'NA':
+            compound_code = dataset
+        input_dir = info.get('Input_dir', 'NA')
+        
+        # Enhanced diagnostic logging for file paths
+        logging.debug(f"Dataset: {dataset}, Compound: {compound_code}")
+        
+        # Construct paths to input files in the input directory
+        input_smi_path = 'NA'
+        input_pdb_path = 'NA' 
+        input_cif_path = 'NA'
+        
+        if input_dir != 'NA' and os.path.isdir(input_dir) and compound_code != 'NA':
+            # Look for SMILES file
+            potential_smi_path = os.path.join(input_dir, f"{compound_code}.smiles")
+            if os.path.isfile(potential_smi_path):
+                input_smi_path = potential_smi_path
             else:
-                chirality_flip = 'No flip'
-        results.append(build_result(
-            dataset, info, summary_file, ligand_stats, molprobity_stats, postrefinement_stats,
-            electron_density_gif, chirality_flip, pdb_file, mtz_file, map_2fofc_file, map_fofc_file
-        ))
+                # List available files for debugging
+                try:
+                    available_files = [f for f in os.listdir(input_dir) if f.endswith(('.smiles', '.smi', '.pdb', '.cif'))]
+                    if available_files:
+                        truncated_files = available_files[:MAX_DEBUG_FILES_DISPLAY]
+                        ellipsis = '...' if len(available_files) > MAX_DEBUG_FILES_DISPLAY else ''
+                        logging.warning(f"SMILES file not found. Available files: {truncated_files}{ellipsis}")
+                except (OSError, PermissionError):
+                    pass
+                    
+            # Look for input PDB file  
+            potential_pdb_path = os.path.join(input_dir, f"{compound_code}.pdb")
+            if os.path.isfile(potential_pdb_path):
+                input_pdb_path = potential_pdb_path
+                logging.debug(f"Found input PDB: {input_pdb_path}")
+                
+            # Look for input CIF file
+            potential_cif_path = os.path.join(input_dir, f"{compound_code}.cif")
+            if os.path.isfile(potential_cif_path):
+                input_cif_path = potential_cif_path
+                logging.debug(f"Found input CIF: {input_cif_path}")
+            
+        # Enhanced PDB file logging
+        if pdb_file == 'NA':
+            logging.warning(f"No output PDB file found for dataset {dataset}")
+        if output_cif_file == 'NA':
+            logging.warning(f"No output CIF file found for dataset {dataset}")
+            
+        # Define PDB file for chirality analysis (only use best.pdb - no fallback)
+        chirality_pdb_file = 'NA'
+        if pipedream_dir != 'NA' and compound_code != 'NA':
+            best_pdb_path = os.path.join(pipedream_dir, f"rhofit-{compound_code}", "best.pdb")
+            if os.path.isfile(best_pdb_path):
+                chirality_pdb_file = best_pdb_path
+                logging.debug(f"Using best.pdb for chirality analysis: {chirality_pdb_file}")
+            else:
+                logging.debug(f"best.pdb not found, chirality analysis will be skipped")
+        else:
+            logging.debug(f"Pipedream directory or compound code not available, chirality analysis will be skipped")
+            
+        # Always prioritize using CIF input file when available
+        # Input: Must have CIF (PDB optional), Output: Must have both CIF and PDB
+        if (input_cif_path != 'NA' and output_cif_file != 'NA' and 
+            chirality_pdb_file != 'NA' and input_smi_path != 'NA'):
+            
+            logging.debug(f"Using CIF+PDB approach for chirality analysis of {dataset} (input CIF required, output CIF+PDB available)")
+            chirality_flip, updated_smiles = compare_chiral_centers_cif_pdb(
+                input_cif_path, input_pdb_path, output_cif_file, chirality_pdb_file, input_smi_path, dataset)
+            
+            # Save SMILES analysis file
+            if pipedream_dir != 'NA' and compound_code != 'NA':
+                smiles_file_path = os.path.join(pipedream_dir, f"{compound_code}_output_smiles.smiles")
+                try:
+                    with open(smiles_file_path, 'w') as f:
+                        f.write(f"# Chirality analysis results\n")
+                        f.write(f"# Dataset: {dataset}\n")
+                        f.write(f"# Analysis method: CIF+PDB comparison\n")
+                        f.write(f"# Result: {chirality_flip}\n")
+                        f.write(f"{updated_smiles}\n")
+                    updated_smiles_file = smiles_file_path
+                    logging.debug(f"Saved SMILES analysis to: {smiles_file_path}")
+                except Exception as e:
+                    logging.error(f"Error saving SMILES file: {e}")
+                    updated_smiles_file = 'NA'
+            else:
+                updated_smiles_file = 'NA'
+                
+        # Fallback to original SMILES+PDB approach if CIF requirements not met
+        elif input_smi_path != 'NA' and chirality_pdb_file != 'NA':
+            missing_cif_info = []
+            if input_cif_path == 'NA':
+                missing_cif_info.append("input CIF")
+            if output_cif_file == 'NA':
+                missing_cif_info.append("output CIF")
+            
+            logging.debug(f"CIF requirements not met (missing: {', '.join(missing_cif_info)}), using fallback SMILES+PDB approach for chirality analysis of {dataset}")
+            chirality_flip, updated_smiles = detect_chiral_inversion(input_smi_path, chirality_pdb_file, input_pdb_path, pipedream_dir, compound_code)
+            
+            # Construct expected path to analysis file
+            if pipedream_dir != 'NA' and compound_code != 'NA':
+                expected_smiles_file = os.path.join(pipedream_dir, f"{compound_code}_output_smiles.smiles")
+                updated_smiles_file = expected_smiles_file if os.path.exists(expected_smiles_file) else 'NA'
+            else:
+                updated_smiles_file = 'NA'
+            
+        else:
+            missing_info = []
+            if input_smi_path == 'NA':
+                missing_info.append("SMILES file")
+            if chirality_pdb_file == 'NA':
+                missing_info.append("output PDB file")
+            chirality_flip = f"Missing: {', '.join(missing_info)}"
+            updated_smiles_file = "NA"
+            logging.warning(f"Skipping chirality analysis for {dataset}: {chirality_flip}")
+        
+        # Build the result and add it to results list
+        result = build_result(
+            dataset=dataset,
+            info=info,
+            summary_file=summary_file,
+            ligand_stats=ligand_stats,
+            molprobity_stats=molprobity_stats,
+            postrefinement_stats=postrefinement_stats,
+            electron_density_gif=electron_density_gif,
+            chirality_flip=chirality_flip,
+            updated_smiles_file=updated_smiles_file,
+            pdb_file=pdb_file,
+            mtz_file=mtz_file,
+            map_2fofc_file=map_2fofc_file,
+            map_fofc_file=map_fofc_file,
+            high_resolution=high_resolution
+        )
+        results.append(result)
+    
     return results
 
 
-def create_result(dataset: str, info: dict, summary_file: str) -> Dict[str, Any]:
-    """Legacy stub for missing summary file; replaced by build_result for consistency."""
-    return build_result(dataset, info, summary_file)
+def get_cell_style_and_value(col: str, cell_val: Any, row: pd.Series) -> tuple[str, str]:
+    """Get the appropriate styling and display value for a table cell."""
+    style = ''
+    display_val = str(cell_val)
+    
+    # Try to format numbers to 2 decimal places if possible
+    try:
+        num_val = float(cell_val)
+        display_val = f"{num_val:.2f}"
+    except (ValueError, TypeError):
+        pass
+    
+    # Apply numeric highlighting rules
+    try:
+        val = float(cell_val)
+        if col == 'Rfree' and val > 0.3:
+            style = 'background-color: #ffcccc; font-weight: bold;'
+        elif col == 'R' and val > 0.3:
+            style = 'background-color: #ffcccc; font-weight: bold;'
+        elif col == 'Mogul Z angle' and val > 2:
+            style = 'background-color: #ffcccc; font-weight: bold;'
+        elif col == 'Mogul Z bond' and val > 2:
+            style = 'background-color: #ffcccc; font-weight: bold;'
+        elif col == 'Ligand avg B factor':
+            try:
+                mean_b = float(row['Mean B factor'])
+                if mean_b != 0 and val / mean_b >= B_FACTOR_RATIO_THRESHOLD:
+                    style = 'background-color: #ffcccc; font-weight: bold;'
+            except (ValueError, TypeError, ZeroDivisionError):
+                pass
+        elif col == 'Rama outlier percent' and val > 0.5:
+            style = 'background-color: #ffcccc; font-weight: bold;'
+        elif col == 'Poor rotamer percent' and val > 2:
+            style = 'background-color: #ffcccc; font-weight: bold;'
+        elif col == 'Clash score' and val > 20:
+            style = 'background-color: #ffcccc; font-weight: bold;'
+        elif col == 'Mol probity score' and val > 2:
+            style = 'background-color: #ffcccc; font-weight: bold;'
+        elif col == 'c beta deviations' and val > 0:
+            style = 'background-color: #ffcccc; font-weight: bold;'
+        elif col == 'RMS angles' and val > 3:
+            style = 'background-color: #ffcccc; font-weight: bold;'
+        elif col == 'RMS bonds' and val > 0.03:
+            style = 'background-color: #ffcccc; font-weight: bold;'
+    except (ValueError, TypeError):
+        pass
+    
+    return style, display_val
 
 
-def save_results_to_html(results: List[Dict[str, Any]], output_file: str) -> None:
+def get_cell_html(col: str, cell_val: Any, row: pd.Series) -> str:
+    """Generate HTML for a specific table cell based on column type."""
+    if col == 'Export to XCE':
+        return f'<td><input type="checkbox" {"checked" if cell_val == "True" else ""}></td>'
+    elif col == 'Comments':
+        return f'<td><input type="text" value="{cell_val}"></td>'
+    elif col == 'Input Ligand Structure':
+        return f'<td><img src="file://{cell_val}" alt="Ligand Image" width="150"></td>' if cell_val and cell_val != 'NA' else '<td></td>'
+    elif col == 'Ligand Density':
+        return f'<td><img src="file://{cell_val}" alt="Ligand Density" width="180" style="max-width:180px;max-height:120px;"></td>' if cell_val and cell_val != 'NA' else '<td></td>'
+    elif col == 'Chiral inversion':
+        return f'<td style="color:red;font-weight:bold">{cell_val}</td>' if cell_val and cell_val not in ['Output stereochemistry matches input', 'Not checked'] else f'<td>{cell_val}</td>'
+    elif col in [
+        'Pipedream Directory', 'Buster Report HTML', 'Ligand Report HTML', 'Pipedream Summary',
+        'PDB File', 'MTZ File', '2Fo-Fc Map File', 'Fo-Fc Map File', 'Output SMILES']:
+        return get_file_link_html(cell_val)
+    else:
+        # Regular cell with potential highlighting
+        style, display_val = get_cell_style_and_value(col, cell_val, row)
+        return f'<td style="{style}">{display_val}</td>'
+
+
+def save_results_to_html(results: List[Dict[str, Any]], output_file: str, open_browser: bool = True) -> None:
     """Save results to an interactive HTML file."""
+    logging.info(f"Generating HTML output with {len(results)} results")
+    print(f"Generating HTML report...")
+    
     df = pd.DataFrame(results)
 
     # Ensure 'Ligand CC' is numeric for sorting, non-numeric values become NaN
     df['Ligand CC'] = pd.to_numeric(df['Ligand CC'], errors='coerce')
     # Auto sort by Ligand CC descending (NaNs will be at the end)
     df = df.sort_values(by='Ligand CC', ascending=False)
+    logging.debug(f"Sorted results by Ligand CC")
 
     # Define the desired column order (ensure it's always defined)
-    column_order = [
-        'Export to XCE',
-        'Comments',
-        'Crystal Name',
-        'Compound Code',
-        'Ligand Structure',
-        'Ligand Density',
-        'Chirality Flips',
-        'Pipedream Directory',
-        'Buster Report HTML',
-        'Ligand Report HTML',
-        'Ligand CC',
-        'Ligand occupancy',
-        'Ligand avg B factor',
-        'Mean B factor',
-        'R',
-        'Rfree',
-        'Mogul Z angle',
-        'Mogul Z bond',
-        'c beta deviations',
-        'Rama outlier percent',
-        'Rama favored percent',
-        'Poor rotamer percent',
-        'Clash score',
-        'Mol probity score',
-        'RMS bonds',
-        'RMS angles',
-        'Pipedream Summary',
-        'PDB File',
-        'MTZ File',
-        '2Fo-Fc Map File',
-        'Fo-Fc Map File'
-    ]
+    column_order = COLUMN_ORDER
 
     # Build table rows with actual cell values in the new order
     table_rows = []
     for _, row in df.iterrows():
         row_html = '<tr>'
         for col in column_order:
-            cell_val = row[col]
-            style = ''
-            display_val = cell_val
-            # Try to format numbers to 2 decimal places if possible
-            try:
-                num_val = float(cell_val)
-                display_val = f"{num_val:.2f}"
-            except (ValueError, TypeError):
-                pass
-            # Highlighting rules
-            if col == 'Export to XCE':
-                row_html += f'<td><input type="checkbox" {"checked" if cell_val == "True" else ""}></td>'
-            elif col == 'Comments':
-                row_html += f'<td><input type="text" value="{cell_val}"></td>'
-            elif col == 'Ligand Structure':
-                row_html += f'<td><img src="file://{cell_val}" alt="Ligand Image" width="150"></td>' if cell_val and cell_val != 'NA' else '<td></td>'
-            elif col == 'Ligand Density':
-                row_html += f'<td><img src="file://{cell_val}" alt="Ligand Density" width="180" style="max-width:180px;max-height:120px;"></td>' if cell_val and cell_val != 'NA' else '<td></td>'
-            elif col == 'Chirality Flips':
-                row_html += f'<td style="color:red;font-weight:bold">{cell_val}</td>' if cell_val and cell_val not in ['No flip', 'Not checked'] else f'<td>{cell_val}</td>'
-            elif col in [
-                'Pipedream Directory', 'Buster Report HTML', 'Ligand Report HTML', 'Pipedream Summary',
-                'PDB File', 'MTZ File', '2Fo-Fc Map File', 'Fo-Fc Map File']:
-                if cell_val and cell_val != 'NA':
-                    file_ext = os.path.splitext(cell_val)[1].lower()
-                    # Use a data attribute for the file path
-                    row_html += f'<td><a href="#" class="file-link" data-file="file://{cell_val}" data-ext="{file_ext}">{os.path.basename(cell_val)}</a></td>'
-                else:
-                    row_html += '<td></td>'
-            else:
-                # Numeric highlighting rules
-                try:
-                    val = float(cell_val)
-                    if col == 'Rfree' and val > 0.3:
-                        style = 'background-color: #ffcccc; font-weight: bold;'
-                    elif col == 'R' and val > 0.3:
-                        style = 'background-color: #ffcccc; font-weight: bold;'
-                    elif col == 'Mogul Z angle' and val > 2:
-                        style = 'background-color: #ffcccc; font-weight: bold;'
-                    elif col == 'Mogul Z bond' and val > 2:
-                        style = 'background-color: #ffcccc; font-weight: bold;'
-                    elif col == 'Ligand avg B factor':
-                        try:
-                            mean_b = float(row['Mean B factor'])
-                            if mean_b != 0 and val / mean_b >= 1.5:
-                                style = 'background-color: #ffcccc; font-weight: bold;'
-                        except (ValueError, TypeError, ZeroDivisionError):
-                            pass
-                    elif col == 'Rama outlier percent' and val > 0.5:
-                        style = 'background-color: #ffcccc; font-weight: bold;'
-                    elif col == 'Poor rotamer percent' and val > 2:
-                        style = 'background-color: #ffcccc; font-weight: bold;'
-                    elif col == 'Clash score' and val > 20:
-                        style = 'background-color: #ffcccc; font-weight: bold;'
-                    elif col == 'Mol probity score' and val > 2:
-                        style = 'background-color: #ffcccc; font-weight: bold;'
-                    elif col == 'c beta deviations' and val > 0:
-                        style = 'background-color: #ffcccc; font-weight: bold;'
-                    elif col == 'RMS angles' and val > 3:
-                        style = 'background-color: #ffcccc; font-weight: bold;'
-                    elif col == 'RMS bonds' and val > 0.03:
-                        style = 'background-color: #ffcccc; font-weight: bold;'
-                except (ValueError, TypeError):
-                    pass
-                row_html += f'<td style="{style}">{display_val}</td>'
+            row_html += get_cell_html(col, row[col], row)
         row_html += '</tr>'
         table_rows.append(row_html)
 
     # Render table header HTML outside JS template
     table_header_html = ''.join([f'<th>{col}</th>' for col in column_order])
+    
+    # Calculate Ligand CC column index for sorting
+    ligand_cc_index = column_order.index('Ligand CC') if 'Ligand CC' in column_order else 0
 
     html_content = f"""
     <!DOCTYPE html>
@@ -311,6 +1367,7 @@ def save_results_to_html(results: List[Dict[str, Any]], output_file: str) -> Non
         <link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css\">
         <link rel=\"stylesheet\" href=\"https://cdn.datatables.net/1.13.4/css/dataTables.bootstrap5.min.css\">
         <script src=\"https://code.jquery.com/jquery-3.6.0.min.js\"></script>
+        <script src=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js\"></script>
         <script src=\"https://cdn.datatables.net/1.13.4/js/jquery.dataTables.min.js\"></script>
         <script src=\"https://cdn.datatables.net/1.13.4/js/dataTables.bootstrap5.min.js\"></script>
         <style>
@@ -365,15 +1422,85 @@ def save_results_to_html(results: List[Dict[str, Any]], output_file: str) -> Non
                 height: 20px;
                 margin: 4px;
             }}
+            /* File link styling */
+            .file-link {{
+                color: #0066cc;
+                text-decoration: none;
+                cursor: pointer;
+            }}
+            .file-link:hover {{
+                color: #0052a3;
+                text-decoration: underline;
+            }}
+            /* Modal styling */
+            .modal-body iframe {{
+                border: none;
+                width: 100%;
+                height: 70vh;
+            }}
+            .modal-xl {{
+                max-width: 90vw;
+            }}
         </style>
         <script>
             // Embed the original JSON filename for export
             const originalJsonFilename = "{os.path.basename(output_file).replace('.html', '.json')}";
+            
+            // Function to attach modal event handlers
+            function attachModalHandlers() {{
+                // Modal popup for file links
+                $(document).off('click', '.file-link').on('click', '.file-link', function(e) {{
+                    e.preventDefault();
+                    var fileUrl = $(this).data('file');
+                    var ext = $(this).data('ext');
+                    var fileName = $(this).text();
+                    var modalBody = $('#fileModal .modal-body');
+                    var modalTitle = $('#fileModalLabel');
+                    
+                    modalBody.empty();
+                    modalTitle.text('File Viewer - ' + fileName);
+                    
+                    if(ext === '.html') {{
+                        modalBody.append(`<iframe src="${{fileUrl}}" style="width:100%;height:70vh;border:none;"></iframe>`);
+                    }} else if(ext === '.pdb' || ext === '.mtz' || ext === '.map') {{
+                        modalBody.append(`
+                            <div class="alert alert-info">
+                                <h6>File Information:</h6>
+                                <p><strong>File:</strong> ${{fileName}}</p>
+                                <p><strong>Path:</strong> ${{fileUrl.replace('file://', '')}}</p>
+                                <p><strong>Type:</strong> ${{ext.toUpperCase()}} file</p>
+                            </div>
+                            <div class="d-grid gap-2">
+                                <a href="${{fileUrl}}" class="btn btn-primary" download>Download File</a>
+                                <button class="btn btn-secondary" onclick="navigator.clipboard.writeText('${{fileUrl.replace('file://', '')}}'); alert('Path copied to clipboard!')">Copy Path</button>
+                            </div>
+                        `);
+                    }} else if(ext === '.png' || ext === '.jpg' || ext === '.jpeg' || ext === '.gif') {{
+                        modalBody.append(`<img src="${{fileUrl}}" class="img-fluid" alt="${{fileName}}" style="max-width:100%;height:auto;">`);
+                    }} else {{
+                        modalBody.append(`
+                            <div class="alert alert-info">
+                                <h6>File Information:</h6>
+                                <p><strong>File:</strong> ${{fileName}}</p>
+                                <p><strong>Path:</strong> ${{fileUrl.replace('file://', '')}}</p>
+                            </div>
+                            <div class="d-grid gap-2">
+                                <a href="${{fileUrl}}" class="btn btn-primary" target="_blank">Open File</a>
+                                <button class="btn btn-secondary" onclick="navigator.clipboard.writeText('${{fileUrl.replace('file://', '')}}'); alert('Path copied to clipboard!')">Copy Path</button>
+                            </div>
+                        `);
+                    }}
+                    
+                    var modal = new bootstrap.Modal(document.getElementById('fileModal'));
+                    modal.show();
+                }});
+            }}
+            
             $(document).ready(function() {{
                 $('#resultsTable').DataTable({{
                     responsive: true,
                     pageLength: 25,
-                    order: [[8, 'desc']], // Ligand CC column index (0-based)
+                    order: [[{ligand_cc_index}, 'desc']], // Ligand CC column index (0-based)
                     columnDefs: [
                         {{ targets: '_all', type: 'num' }}
                     ],
@@ -383,6 +1510,10 @@ def save_results_to_html(results: List[Dict[str, Any]], output_file: str) -> Non
                     fixedHeader: true,
                     dom: 'Bflrt<"bottom-scrollbar"ip>',
                 }});
+                
+                // Attach modal handlers initially
+                attachModalHandlers();
+                
                 // Only sync scroll for bottom
                 function syncScroll() {{
                     var scrollBody = $('.dataTables_scrollBody')[0];
@@ -392,23 +1523,6 @@ def save_results_to_html(results: List[Dict[str, Any]], output_file: str) -> Non
                     }}
                 }}
                 $('.dataTables_scrollBody').on('scroll', syncScroll);
-
-                // Modal popup for file links
-                $(document).on('click', '.file-link', function(e) {{
-                    e.preventDefault();
-                    var fileUrl = $(this).data('file');
-                    var ext = $(this).data('ext');
-                    var modalBody = $('#fileModal .modal-body');
-                    modalBody.empty();
-                    if(ext === '.html') {{
-                        modalBody.append(`<iframe src="${{fileUrl}}" style="width:100%;height:70vh;border:none;"></iframe>`);
-                    }} else if(ext === '.pdb' || ext === '.mtz' || ext === '.map') {{
-                        modalBody.append(`<p>File: <a href="${{fileUrl}}" download>Download</a></p>`);
-                    }} else {{
-                        modalBody.append(`<p>File: <a href="${{fileUrl}}" target="_blank">Open</a></p>`);
-                    }}
-                    $('#fileModal').modal('show');
-                }});
             }});
             // --- Add exportToJSON function ---
             function exportToJSON() {{
@@ -442,7 +1556,7 @@ def save_results_to_html(results: List[Dict[str, Any]], output_file: str) -> Non
                             }}
                         }} else if ([
                             'Pipedream Directory', 'Buster Report HTML', 'Ligand Report HTML', 'Pipedream Summary',
-                            'PDB File', 'MTZ File', '2Fo-Fc Map File', 'Fo-Fc Map File'
+                            'PDB File', 'MTZ File', '2Fo-Fc Map File', 'Fo-Fc Map File', 'Output SMILES File'
                         ].includes(col)) {{
                             var link = $(cell).find('a.file-link');
                             if (link.length > 0) {{
@@ -488,25 +1602,25 @@ def save_results_to_html(results: List[Dict[str, Any]], output_file: str) -> Non
                                 if (col === 'Export to XCE') {{
                                     rowHtml += '<td><input type="checkbox" ' + (cell === 'True' ? 'checked' : '') + '></td>';
                                 }} else if (col === 'Comments') {{
-                                    rowHtml += '<td><input type="text" value="' + cell + '"></td>';
+                                    rowHtml += '<td><input type="text" value="' + (cell || '') + '"></td>';
                                 }} else if (col === 'Ligand Structure') {{
                                     rowHtml += (cell && cell !== 'NA') ? '<td><img src="file://' + cell + '" alt="Ligand Image" width="150"></td>' : '<td></td>';
                                 }} else if (col === 'Ligand Density') {{
-                                    rowHtml += (cell && cell !== 'NA') ? '<td><img src="file://' + cell + '" alt="Ligand Density" width="180" style="max-width:180px;max-height:120px;"></td>' : '<td></td>';
-                                }} else if (col === 'Chirality Flips') {{
-                                    rowHtml += (cell && cell !== 'No flip' && cell !== 'Not checked') ? '<td style="color:red;font-weight:bold">' + cell + '</td>' : '<td>' + cell + '</td>';
-                                }} else if ([
+                                    rowHtml += (cell && cell !== 'NA') ? '<td><img src="file://' + cell + '" alt="Ligand Density" width="180" style="max-width:180px;max-height:120px;"></td>' : '<td></td>';                        }} else if (col === 'Chiral inversion') {{
+                            rowHtml += (cell && cell !== 'Output stereochemistry matches input' && cell !== 'Not checked') ? '<td style="color:red;font-weight:bold">' + cell + '</td>' : '<td>' + cell + '</td>';
+                        }} else if ([
                                     'Pipedream Directory', 'Buster Report HTML', 'Ligand Report HTML', 'Pipedream Summary',
-                                    'PDB File', 'MTZ File', '2Fo-Fc Map File', 'Fo-Fc Map File'
+                                    'PDB File', 'MTZ File', '2Fo-Fc Map File', 'Fo-Fc Map File', 'Output SMILES'
                                 ].includes(col)) {{
                                     if (cell && cell !== 'NA') {{
-                                        var fileExt = cell.split('.').pop().toLowerCase();
-                                        rowHtml += '<td><a href="#" class="file-link" data-file="file://' + cell + '" data-ext=".' + fileExt + '">' + cell.split(/[\\/]/).pop() + '</a></td>';
+                                        var fileExt = '.' + cell.split('.').pop().toLowerCase();
+                                        var fileName = cell.split(/[\\/]/).pop();
+                                        rowHtml += '<td><a href="#" class="file-link" data-file="file://' + cell + '" data-ext="' + fileExt + '">' + fileName + '</a></td>';
                                     }} else {{
                                         rowHtml += '<td></td>';
                                     }}
                                 }} else {{
-                                    rowHtml += '<td>' + cell + '</td>';
+                                    rowHtml += '<td>' + (cell || '') + '</td>';
                                 }}
                             }});
                             rowHtml += '</tr>';
@@ -516,7 +1630,7 @@ def save_results_to_html(results: List[Dict[str, Any]], output_file: str) -> Non
                         $('#resultsTable').DataTable({{
                             responsive: true,
                             pageLength: 25,
-                            order: [[8, 'desc']],
+                            order: [[{ligand_cc_index}, 'desc']],
                             columnDefs: [{{ targets: '_all', type: 'num' }}],
                             scrollX: true,
                             scrollY: '60vh',
@@ -524,16 +1638,19 @@ def save_results_to_html(results: List[Dict[str, Any]], output_file: str) -> Non
                             fixedHeader: true,
                             dom: 'Bflrt<"bottom-scrollbar"ip>',
                         }});
+                        
+                        // Reattach modal handlers after table rebuild
+                        attachModalHandlers();
+                        
+                        alert('Table updated successfully with ' + jsonData.length + ' records.');
                     }} catch (err) {{
-                        alert('Invalid JSON file.');
+                        alert('Error parsing JSON file: ' + err.message);
+                        console.error('JSON parsing error:', err);
                     }}
                 }};
                 reader.readAsText(file);
             }}
         </script>
-        <!-- Bootstrap Modal -->
-        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
-        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     </head>
     <body>
         <div class="container">
@@ -564,7 +1681,11 @@ def save_results_to_html(results: List[Dict[str, Any]], output_file: str) -> Non
                 <h5 class="modal-title" id="fileModalLabel">File Viewer</h5>
                 <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
               </div>
-              <div class="modal-body">
+              <div class="modal-body" id="fileModalBody">
+                <!-- Content will be dynamically loaded here -->
+              </div>
+              <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
               </div>
             </div>
           </div>
@@ -573,124 +1694,192 @@ def save_results_to_html(results: List[Dict[str, Any]], output_file: str) -> Non
     </html>
     """
 
-    with open(output_file, 'w') as f:
+    with open(output_file, 'w', encoding='utf-8') as f:
         f.write(html_content)
 
-    logging.info(f"Results saved to {output_file}")
-    webbrowser.open(f'file://{os.path.abspath(output_file)}')
+    logging.info(f"HTML report saved to {os.path.basename(output_file)}")
+    print(f"HTML report saved: {os.path.basename(output_file)}")
+    
+    if open_browser:
+        webbrowser.open(f'file://{os.path.abspath(output_file)}')
 
 
 def save_results_to_json(results: List[Dict[str, Any]], output_file: str) -> None:
     """Save results to a JSON file with a consistent column order."""
     # Use the same column order as for HTML
-    column_order = [
-        'Export to XCE',
-        'Comments',
-        'Crystal Name',
-        'Compound Code',
-        'Ligand Structure',
-        'Ligand Density',
-        'Chirality Flips',
-        'Pipedream Directory',
-        'Buster Report HTML',
-        'Ligand Report HTML',
-        'Ligand CC',
-        'Ligand occupancy',
-        'Ligand avg B factor',
-        'Mean B factor',
-        'R',
-        'Rfree',
-        'Mogul Z angle',
-        'Mogul Z bond',
-        'c beta deviations',
-        'Rama outlier percent',
-        'Rama favored percent',
-        'Poor rotamer percent',
-        'Clash score',
-        'Mol probity score',
-        'RMS bonds',
-        'RMS angles',
-        'Pipedream Summary',
-        'PDB File',
-        'MTZ File',
-        '2Fo-Fc Map File',
-        'Fo-Fc Map File'
-    ]
+    column_order = COLUMN_ORDER
     ordered_results = [OrderedDict((col, row.get(col, '')) for col in column_order) for row in results]
-    with open(output_file, 'w') as f:
+    with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(ordered_results, f, indent=2)
-    logging.info(f"Results saved to {output_file}")
+    logging.info(f"Results saved to {os.path.basename(output_file)}")
 
-
-def flag_chirality_flips(input_cif: str, output_cif: str) -> List[Tuple[str, str, str]]:
-    """Compare chirality in input and output CIF files. Returns a list of tuples: (center_id, input_sign, output_sign) for each flipped center."""
-    def parse_chirality(file_path: str) -> Dict[str, str]:
-        chiral_centers = {}
-        with open(file_path, 'r') as f:
-            lines = f.readlines()
-        in_loop = False
-        headers = []
-        for i, line in enumerate(lines):
-            if line.strip().startswith('loop_') and '_chem_comp_chir.comp_id' in ''.join(lines[i+1:i+6]):
-                in_loop = True
-                headers = []
-                continue
-            if in_loop and line.strip().startswith('_chem_comp_chir.'):
-                headers.append(line.strip())
-                continue
-            if in_loop and headers and line.strip() and not line.strip().startswith('_'):
-                parts = line.strip().split()
-                if len(parts) >= 6:
-                    try:
-                        idx_centre = headers.index('_chem_comp_chir.atom_id_centre')
-                        idx_sign = headers.index('_chem_comp_chir.volume_sign')
-                    except ValueError:
-                        continue
-                    chiral_centers[parts[idx_centre]] = parts[idx_sign]
-                else:
-                    in_loop = False
-            if in_loop and (not line.strip() or line.strip().startswith('#')):
-                in_loop = False
-        return chiral_centers
-    input_chir = parse_chirality(input_cif)
-    output_chir = parse_chirality(output_cif)
-    flips = []
-    for center, sign_in in input_chir.items():
-        sign_out = output_chir.get(center)
-        if sign_out and sign_in != sign_out:
-            flips.append((center, sign_in, sign_out))
-    return flips
 
 
 def main() -> None:
     """Main entry point for collating Pipedream results."""
-    parser = argparse.ArgumentParser(description='Collect results from the latest Pipedream_N directories.')
-    parser.add_argument('--json', required=True, help='Path to the JSON file with dataset metadata.')
-    parser.add_argument('--output_file', help='Optional: specify output file name (with .json extension) for results. Defaults to timestamped file in same dir.')
-    args = parser.parse_args()
-    output_dir = os.path.dirname(args.json)
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    if args.output_file:
-        output_file_json = args.output_file
-        output_file_html = args.output_file.replace('.json', '.html')
-    else:
-        output_file_json = os.path.join(output_dir, f'Pipedream_results_{timestamp}.json')
-        output_file_html = os.path.join(output_dir, f'Pipedream_results_{timestamp}.html')
-    log_file = os.path.join(output_dir, 'collate_pipedream_results.log')
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler()
-        ]
+    parser = argparse.ArgumentParser(
+        description='Collate Pipedream analysis results into interactive reports.',
+        epilog='Example: python collate_pipedream_results.py --input results.json --output-dir /path/to/output --format both'
     )
-    json_data = read_json(args.json)
+    
+    # Version argument
+    parser.add_argument(
+        '--version', action='version', version=f'%(prog)s {VERSION}',
+        help="Show version number"
+    )
+    parser.add_argument(
+        '--input', '--json', '-i',
+        dest='input_json',
+        required=True, 
+        help='Path to the JSON file with dataset metadata'
+    )
+    parser.add_argument(
+        '--output-dir',
+        help='Output directory for generated reports (default: same as input JSON)'
+    )
+    parser.add_argument(
+        '--output-name',
+        help='Base name for output files without extension (default: timestamped Pipedream_results_YYYYMMDD_HHMMSS)'
+    )
+    parser.add_argument(
+        '--format',
+        choices=['json', 'html', 'both'],
+        default='both',
+        help='Output format(s) to generate (default: both)'
+    )
+    parser.add_argument(
+        '--no-browser',
+        action='store_true',
+        help='Don\'t automatically open HTML report in browser'
+    )
+    parser.add_argument(
+        '--verbose', '-v',
+        action='store_true',
+        help='Enable verbose console output'
+    )
+    parser.add_argument(
+        '--log-level',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+        default='DEBUG',
+        help='Set logging level (default: DEBUG)'
+    )
+    
+    args = parser.parse_args()
+    
+    # Validate input file exists
+    if not os.path.isfile(args.input_json):
+        parser.error(f"Input JSON file not found: {args.input_json}")
+    
+    # Validate input file extension
+    if not args.input_json.lower().endswith('.json'):
+        parser.error("Input file must have a .json extension")
+    
+    # Determine output directory
+    if args.output_dir:
+        output_dir = args.output_dir
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except PermissionError:
+            parser.error(f"Cannot create output directory: {output_dir} (permission denied)")
+        except Exception as e:
+            parser.error(f"Cannot create output directory: {output_dir} ({e})")
+    else:
+        output_dir = os.path.dirname(args.input_json)
+    
+    # Determine output file names
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    if args.output_name:
+        base_name = args.output_name
+    else:
+        base_name = f'Pipedream_results_{timestamp}'
+    
+    output_file_json = os.path.join(output_dir, f'{base_name}.json')
+    output_file_html = os.path.join(output_dir, f'{base_name}.html')
+    
+    log_file = os.path.join(output_dir, f'{base_name}.log')
+    
+    # Configure logging with different levels for file vs console
+    logger = logging.getLogger()
+    logger.setLevel(getattr(logging, args.log_level))
+    
+    # File handler - captures everything based on log level
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(getattr(logging, args.log_level))
+    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_formatter)
+    
+    # Console handler - verbose mode or essential messages only
+    console_handler = logging.StreamHandler()
+    if args.verbose:
+        console_handler.setLevel(logging.INFO)
+    else:
+        console_handler.setLevel(logging.WARNING)
+    console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(console_formatter)
+    
+    # Add a custom filter for console when not in verbose mode
+    if not args.verbose:
+        class ConsoleFilter(logging.Filter):
+            def filter(self, record):
+                # Allow WARNING and above
+                if record.levelno >= logging.WARNING:
+                    return True
+                # Allow specific INFO messages for terminal
+                if record.levelno == logging.INFO:
+                    essential_messages = [
+                        "JSON file read successfully",
+                        "Processing dataset:",
+                        "Results saved to",
+                        "Result collection completed"
+                    ]
+                    # Check for exact matches or "Processing X datasets" pattern
+                    message = record.getMessage()
+                    if any(msg in message for msg in essential_messages):
+                        return True
+                    # Also allow "Processing X datasets" pattern
+                    if message.startswith("Processing ") and message.endswith(" datasets"):
+                        return True
+                    return False
+                return False
+        
+        console_handler.addFilter(ConsoleFilter())
+    
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    logging.info("Starting Pipedream results collation")
+    print("Starting Pipedream results collation...")
+    
+    logging.info(f"Reading JSON file: {args.input_json}")
+    json_data = read_json(args.input_json)
+    
+    logging.info("Validating JSON structure")
     validate_json_structure(json_data)
+    
+    logging.info("Collecting results from datasets")
     results = collect_results_from_json(json_data)
-    save_results_to_json(results, output_file_json)
-    save_results_to_html(results, output_file_html)
+    
+    # Generate outputs based on format selection
+    if args.format in ['json', 'both']:
+        logging.info(f"Saving results to JSON: {output_file_json}")
+        print(f"Saving JSON results...")
+        save_results_to_json(results, output_file_json)
+    
+    if args.format in ['html', 'both']:
+        logging.info(f"Generating HTML report: {output_file_html}")
+        # Pass the no_browser flag to the HTML generation function
+        save_results_to_html(results, output_file_html, open_browser=not args.no_browser)
+    
     logging.info("Result collection completed.")
+    print("Pipedream results collation completed!")
+    
+    # Print summary of what was generated
+    print(f"\nOutput summary:")
+    if args.format in ['json', 'both']:
+        print(f"  JSON: {output_file_json}")
+    if args.format in ['html', 'both']:
+        print(f"  HTML: {output_file_html}")
+    print(f"  Log:  {log_file}")
 
 
 if __name__ == "__main__":
