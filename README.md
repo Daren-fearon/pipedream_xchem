@@ -54,7 +54,7 @@ Install missing packages using:
 
 ## YAML Configuration ⚙️
 
-Create a YAML file (e.g., `pipedream_parameters.yaml`) with the following structure (or copy the template file from /dls/science/groups/i04-1/software/pipedream/pipedream_parameters.yaml):
+Create a YAML file (e.g., `pipedream_parameters.yaml`) with the following structure (or copy the template file from /dls/science/groups/i04-1/software/pipedream_xchem/pipedream_parameters.yaml):
 
 ## Parameter Descriptions
 
