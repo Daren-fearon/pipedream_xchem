@@ -1,0 +1,52 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.micromamba/
+.mamba/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Logs and debug files
+*.log
+*.bak
+*.tmp
+*.swp
+
+# Output files
+*.html
+*.json
+*.csv
+*.pdf
+*.map
+*.mtz
+*.pdb
+*.cif
+*.png
+*.smiles
+*.sqlite
+*.svg
+
+# SLURM job scripts and logs
+pipedream_array_job.sh
+array_logs/
+slurm-*.out
+slurm-*.err
+
+# System files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
