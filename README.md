@@ -48,7 +48,6 @@ Install missing packages using:
 | pipedream_parameters.yaml     | Configuration file for refinement parameters            |
 | datasets.csv                  | List of specific datasets to process                    |
 | soakDBDataFile.sqlite         | SQLite database with dataset metadata                   |
-|-------------------------------|---------------------------------------------------------|
 
 ---
 
