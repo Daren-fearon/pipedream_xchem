@@ -109,7 +109,7 @@ Refinement_parameters: #For more information see https://www.globalphasing.com/b
 
 **Running the Pipeline**
 
-Python scripts can be found on DLS file system at `/dls/science/groups/i04-1/software/pipedream/`
+Python scripts can be found on DLS file system at `/dls/science/groups/i04-1/software/pipedream_xchem/`
 
 ---
 
