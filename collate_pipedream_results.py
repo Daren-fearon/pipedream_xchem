@@ -52,7 +52,7 @@ def check_gemmi_availability():
     Check if gemmi is available and return the command to use.
     
     Returns:
-        tuple: (is_available: bool, command: List[str] or None)
+        Tuple[bool, Optional[List[str]]]: (is_available, command)
     """
     # Try direct gemmi command first
     try:
@@ -1075,18 +1075,16 @@ def collect_results_from_json(json_data: dict) -> List[Dict[str, Any]]:
             else:
                 logging.debug(f"No postrefinement entries found or not a list: {type(postrefinement)}")
         
-        # Always try to find MTZ file from JSON since it's not in the rhofit directory
-        postrefinement = safe_get(summary, ['pipedream_outputs', 'ligandfitting', 'ligands', 0, 'postrefinement'], [])
-        if isinstance(postrefinement, list):
-            for entry in postrefinement:
-                if entry.get('description') == 'final' and entry.get('type') == 'map' and entry.get('format') == 'MTZ':
-                    mtz_file = build_file_path(
-                        info.get('PipedreamDirectory', 'NA'),
-                        entry.get('relative_path', ''),
-                        entry.get('filename', '')
-                    )
-                    logging.debug(f"Found MTZ file: {mtz_file}")
-                    break
+        # Directly find output mtz file
+        pipedream_dir = info.get('PipedreamDirectory', 'NA')
+        compound_code = info.get('CompoundCode', 'NA')
+        if pipedream_dir != 'NA' and compound_code != 'NA':
+            mtz_file = os.path.join(pipedream_dir, f'postrefine-{compound_code}', 'refine.mtz')
+            if not os.path.isfile(mtz_file):
+                logging.warning(f"MTZ file not found at expected location: {mtz_file}")
+                mtz_file = 'NA'
+        else:
+            mtz_file = 'NA'
         
         # Generate map files if MTZ file is valid
         logging.debug(f"Attempting map generation for MTZ file: {mtz_file}")
@@ -1608,10 +1606,7 @@ def save_results_to_html(results: List[Dict[str, Any]], output_file: str, open_b
                                 }} else if (col === 'Ligand Density') {{
                                     rowHtml += (cell && cell !== 'NA') ? '<td><img src="file://' + cell + '" alt="Ligand Density" width="180" style="max-width:180px;max-height:120px;"></td>' : '<td></td>';                        }} else if (col === 'Chiral inversion') {{
                             rowHtml += (cell && cell !== 'Output stereochemistry matches input' && cell !== 'Not checked') ? '<td style="color:red;font-weight:bold">' + cell + '</td>' : '<td>' + cell + '</td>';
-                        }} else if ([
-                                    'Pipedream Directory', 'Buster Report HTML', 'Ligand Report HTML', 'Pipedream Summary',
-                                    'PDB File', 'MTZ File', '2Fo-Fc Map File', 'Fo-Fc Map File', 'Output SMILES'
-                                ].includes(col)) {{
+                        }} else if (col === 'Pipedream Directory' || col === 'Buster Report HTML' || col === 'Ligand Report HTML' || col === 'Pipedream Summary' || col === 'PDB File' || col === 'MTZ File' || col === '2Fo-Fc Map File' || col === 'Fo-Fc Map File' || col === 'Output SMILES') {{
                                     if (cell && cell !== 'NA') {{
                                         var fileExt = '.' + cell.split('.').pop().toLowerCase();
                                         var fileName = cell.split(/[\\/]/).pop();
@@ -1650,6 +1645,13 @@ def save_results_to_html(results: List[Dict[str, Any]], output_file: str, open_b
                 }};
                 reader.readAsText(file);
             }}
+            
+            function selectAllExport() {{
+                $('#resultsTable tbody input[type=checkbox]').prop('checked', true);
+            }}
+            function unselectAllExport() {{
+                $('#resultsTable tbody input[type=checkbox]').prop('checked', false);
+            }}
         </script>
     </head>
     <body>
@@ -1658,6 +1660,8 @@ def save_results_to_html(results: List[Dict[str, Any]], output_file: str, open_b
                 <input type="file" id="jsonFileInput" accept="application/json" style="display:none" onchange="loadJsonAndUpdateTable(event)">
                 <button class="btn btn-warning" onclick="document.getElementById('jsonFileInput').click()">Load JSON and Update Table</button>
                 <button class="btn btn-success" onclick="exportToJSON()">Export Table to JSON</button>
+                <button class="btn btn-primary" onclick="selectAllExport()">Select All</button>
+                <button class="btn btn-secondary" onclick="unselectAllExport()">Unselect All</button>
             </div>
             <h1 class="text-center">Pipedream XChem Results</h1>
             <div class="table-responsive">
@@ -1840,7 +1844,6 @@ def main() -> None:
                     if message.startswith("Processing ") and message.endswith(" datasets"):
                         return True
                     return False
-                return False
         
         console_handler.addFilter(ConsoleFilter())
     
