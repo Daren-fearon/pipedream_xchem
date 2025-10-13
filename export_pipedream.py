@@ -256,27 +256,105 @@ def handle_chirality_change(crystal, compound_code, entry, yaml_params, pipedrea
             log_crystal_progress(crystal, f"WARNING - no output CIF file found for {compound_code}")
         
         # Copy new restraint files to compound directory (forcefully overwrite)
+        def safe_copy_file(src, dst, crystal_name):
+            """Copy file to dst using a temp-file-and-rename strategy to avoid partial writes
+            and to provide clearer logging/fallbacks when permission errors occur."""
+            try:
+                if not src or not os.path.exists(src):
+                    raise FileNotFoundError(src)
+
+                dst_dir = os.path.dirname(dst)
+                os.makedirs(dst_dir, exist_ok=True)
+
+                # Copy to a temporary file in the destination directory then rename
+                tmp_dst = dst + ".tmp"
+                if os.path.exists(tmp_dst):
+                    try:
+                        os.remove(tmp_dst)
+                    except Exception:
+                        pass
+
+                shutil.copy2(src, tmp_dst)
+                # Ensure file permissions are reasonable (rw-r--r--)
+                try:
+                    os.chmod(tmp_dst, 0o644)
+                except Exception:
+                    # Not critical; may fail on some filesystems
+                    pass
+
+                # Atomic move
+                os.replace(tmp_dst, dst)
+                log_crystal_progress(crystal_name, f"copied file {src} -> {dst} (atomic)")
+                return True
+
+            except PermissionError as pe:
+                logging.error(f"Permission error copying {src} to {dst}: {pe}")
+                # Fallback: try a direct copy without temp if allowed
+                try:
+                    shutil.copy2(src, dst)
+                    log_crystal_progress(crystal_name, f"copied file {src} -> {dst} (fallback)")
+                    return True
+                except Exception as e:
+                    logging.error(f"Fallback copy also failed for {src} -> {dst}: {e}")
+                    return False
+            except FileNotFoundError:
+                logging.warning(f"Source file not found: {src}")
+                return False
+            except Exception as e:
+                logging.error(f"Error copying {src} to {dst}: {e}")
+                return False
+
+        # Use safe_copy_file for PDB and CIF
         if refined_pdb_file and os.path.exists(refined_pdb_file):
-            shutil.copy2(refined_pdb_file, target_pdb)
-            log_crystal_progress(crystal, f"copied new PDB restraints {refined_pdb_file} -> {target_pdb}")
+            if not safe_copy_file(refined_pdb_file, target_pdb, crystal):
+                logging.warning(f"Refined PDB file copy failed: {refined_pdb_file} -> {target_pdb}")
         else:
             logging.warning(f"Refined PDB file not found: {refined_pdb_file}")
-        
+
         if output_cif_file and os.path.exists(output_cif_file):
-            shutil.copy2(output_cif_file, target_cif)
-            log_crystal_progress(crystal, f"copied new CIF restraints {output_cif_file} -> {target_cif}")
-            
-            # Create/update symlink to CIF in crystal directory
-            safe_symlink(target_cif, symlink_cif)
-            log_crystal_progress(crystal, f"updated CIF symlink {target_cif} -> {symlink_cif}")
+            if safe_copy_file(output_cif_file, target_cif, crystal):
+                # Create/update symlink to CIF in crystal directory
+                safe_symlink(target_cif, symlink_cif)
+                log_crystal_progress(crystal, f"updated CIF symlink {target_cif} -> {symlink_cif}")
+            else:
+                logging.warning(f"Failed to copy CIF file: {output_cif_file} -> {target_cif}")
         else:
             logging.warning(f"Output CIF file not found: {output_cif_file}")
         
-        # Save new SMILES to file
+        # Save new SMILES to file (atomic write)
+        def safe_write_text_file(path, text, crystal_name):
+            try:
+                dst_dir = os.path.dirname(path)
+                os.makedirs(dst_dir, exist_ok=True)
+                tmp_path = path + ".tmp"
+                with open(tmp_path, 'w', encoding='utf-8') as f:
+                    f.write(text)
+                try:
+                    os.chmod(tmp_path, 0o644)
+                except Exception:
+                    pass
+                os.replace(tmp_path, path)
+                log_crystal_progress(crystal_name, f"wrote text file {path} (atomic)")
+                return True
+            except PermissionError as pe:
+                logging.error(f"Permission error writing {path}: {pe}")
+                try:
+                    with open(path, 'w', encoding='utf-8') as f:
+                        f.write(text)
+                    log_crystal_progress(crystal_name, f"wrote text file {path} (fallback)")
+                    return True
+                except Exception as e:
+                    logging.error(f"Fallback write failed for {path}: {e}")
+                    return False
+            except Exception as e:
+                logging.error(f"Error writing file {path}: {e}")
+                return False
+
         if new_smiles and new_smiles != "NA":
-            with open(target_smiles, 'w') as f:
-                f.write(new_smiles)
-            log_crystal_progress(crystal, f"saved new SMILES to {target_smiles}")
+            if safe_write_text_file(target_smiles, new_smiles, crystal):
+                log_crystal_progress(crystal, f"saved new SMILES to {target_smiles}")
+            else:
+                log_crystal_progress(crystal, f"failed to save SMILES to {target_smiles}")
             
             # Generate PNG from new SMILES
             if generate_png_from_smiles(new_smiles, target_png):
@@ -401,7 +479,7 @@ def main():
         "RefinementStatus", "RefinementBusterReportHTML", "RefinementRefiner",
         "RefinementDate", "LastUpdated", "LastUpdated_by", "CrystalName",
         "DataProcessingResolutionHigh", "RefinementRmsdBonds", "RefinementRmsdBondsTL",
-        "RefinementRmsdAngles", "RefinementRmsdAnglesTL", "CompoundSMILES", "RefinementCIFProgram",
+        "RefinementRmsdAngles", "RefinementRmsdAnglesTL", "CompoundSMILES", "RefinementCIFprogram",
         "RefinementComment"
     ]
     missing_columns = [col for col in required_columns if not column_exists(cursor, "mainTable", col)]
@@ -736,7 +814,7 @@ def main():
                 RefinementDate = ?,
                 LastUpdated = ?,
                 LastUpdated_by = ?,
-                RefinementCIFProgram = 'Grade2',
+                RefinementCIFprogram = 'Grade2',
                 RefinementComment = ?
             WHERE CrystalName = ?
             """
