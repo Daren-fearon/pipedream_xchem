@@ -17,7 +17,7 @@ Before running any scripts, ensure the following environment is correctly config
 **1. Micromamba Setup**
 If not already initialized:
 
-    `micromamba init`
+    `micromamba-init`
 
 **2. Activate XChem Environment**
 
@@ -48,6 +48,7 @@ Install missing packages using:
 | pipedream_parameters.yaml     | Configuration file for refinement parameters            |
 | datasets.csv                  | List of specific datasets to process                    |
 | soakDBDataFile.sqlite         | SQLite database with dataset metadata                   |
+|-------------------------------|---------------------------------------------------------|
 
 ---
 
