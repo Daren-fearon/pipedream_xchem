@@ -96,6 +96,9 @@ Refinement_parameters: #For more information see https://www.globalphasing.com/b
 - **Refinement_parameters**: Options passed to the `pipedream` command. For more information see [here](https://www.globalphasing.com/buster/manual/pipedream/manual/index.html#_details_of_command_line_arguments).
     - `keepwater: true` - DO NOT remove waters that are present in the input model (default is to remove them)
     - `mrefine: "TLSbasic"` - "TLSbasic" turns on TLS refinement and autoncs. Leave blank for no TLS.
+    - `keepwater: true` - DO NOT remove waters that are present in the input model (default is to remove them)
+    -  `WaterUpdatePkmaps: true` - Update water pkmaps during refinement
+    -  `TLS: "TLSbasic"` - "TLSbasic" turns on TLS refinement and autoncs. Leave blank for no TLS.
     - `remediate: true` - Run SideAide to refit side chains
     - `sidechainrebuild: true` - Allow SideAide to rebuild stubbed sidechains
     - `runpepflip: true` - Run pepflip to check for and correct peptide bond flips
