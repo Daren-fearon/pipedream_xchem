@@ -168,7 +168,7 @@ A log file named `Pipedream_results_yyyymmdd_hhmmss.log` will be created in th
 ---
 
 ### Step 3: Export to XCE
-`python export_pipedream_to_xce.py --input /path/to/results.json --parameters /path/to/pipedream_parameters.yaml`
+`python export_pipedream.py --input /path/to/results.json --parameters /path/to/pipedream_parameters.yaml`
 
 This script exports completed Pipedream refinement results to XChem Explorer (XCE) format and updates the associated SQLite database. It processes validated results from the collation script, integrates them into the XCE file structure, and handles special cases like chirality inversions by updating restraint files and molecular diagrams.
 
