@@ -703,6 +703,24 @@ def write_array_job_script(
     if num_datasets < 1:
         raise ValueError("No datasets to process: cannot write SLURM array job script.")
     
+    # Add validation to ensure all required paths exist
+    if not datasets_csv or not os.path.exists(datasets_csv):
+        raise ValueError(f"Datasets CSV file does not exist: {datasets_csv}")
+    
+    # Ensure the parent directory of script_path exists
+    script_dir = os.path.dirname(script_path)
+    if not os.path.exists(script_dir):
+        logging.warning(f"Script directory does not exist, creating: {script_dir}")
+        os.makedirs(script_dir, exist_ok=True)
+    
+    # Log the parameters being used
+    logging.info(f"Writing SLURM script with parameters:")
+    logging.info(f"  datasets_csv: {datasets_csv}")
+    logging.info(f"  output_dir: {output_dir}")
+    logging.info(f"  num_datasets: {num_datasets}")
+    logging.info(f"  script_path: {script_path}")
+    logging.info(f"  processing_dir: {processing_dir}")
+    
     # Cap at maximum concurrent jobs
     script_content = """#!/bin/bash
 #SBATCH --job-name=pipedream_array
@@ -856,23 +874,45 @@ fi
         output_dir=output_dir
     )
     
-    # Write the script to file
+    # Write the script to file with explicit error handling
     try:
-        with open(script_path, "w", encoding='utf-8') as f:
+        # First, write to a temporary file
+        temp_script_path = script_path + '.tmp'
+        with open(temp_script_path, "w", encoding='utf-8') as f:
             f.write(script_content)
-        logging.info(f"SLURM script written to: {script_path} ({len(script_content)} characters)")
         
-        # Verify the file was written correctly
-        with open(script_path, "r", encoding='utf-8') as f:
-            written_content = f.read()
-        if len(written_content) == 0:
-            raise ValueError(f"Script file is empty after writing: {script_path}")
-        logging.info(f"SLURM script verification: file contains {len(written_content)} characters")
+        # Verify temp file was written correctly
+        if not os.path.exists(temp_script_path):
+            raise IOError(f"Failed to create temporary script file: {temp_script_path}")
+        
+        temp_size = os.path.getsize(temp_script_path)
+        if temp_size == 0:
+            raise ValueError(f"Temporary script file is empty: {temp_script_path}")
+        
+        # Move temp file to final location
+        shutil.move(temp_script_path, script_path)
+        
+        logging.info(f"SLURM script written to: {script_path} ({temp_size} bytes)")
+        
+        # Final verification
+        if not os.path.exists(script_path):
+            raise IOError(f"Script file does not exist after writing: {script_path}")
+        
+        final_size = os.path.getsize(script_path)
+        if final_size == 0:
+            raise ValueError(f"Final script file is empty: {script_path}")
+        
+        logging.info(f"SLURM script verification: file contains {final_size} bytes")
             
     except Exception as e:
         logging.error(f"Error writing SLURM script to {script_path}: {e}")
+        # Clean up temp file if it exists
+        if os.path.exists(temp_script_path):
+            try:
+                os.remove(temp_script_path)
+            except:
+                pass
         raise
-
 def submit_sbatch_on_wilson(script_path: str, processing_dir: str) -> None:
     """
     SSH to wilson and submit the job script using sbatch, using password authentication.
