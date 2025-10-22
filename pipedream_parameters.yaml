@@ -8,7 +8,8 @@ Dataset_csv_path: /dls/science/groups/i04-1/software/pipedream/pipedream_slurm_t
 Remove_crystallisation_components: true  # Optional - removes DMS, EDO, GOL, SO4, PO4, PEG from input PDBs if true (can skip if not modelled in site of interest in MR model)
 Refinement_parameters: #For more information see https://www.globalphasing.com/buster/manual/pipedream/manual/index.html#_details_of_command_line_arguments
   keepwater: true #DO NOT remove waters that are present in the input model (default is to remove them)
-  mrefine: "TLSbasic" #"TLSbasic" turns on TLS refinement and autoncs. Leave blank for no TLS.
+  WaterUpdatePkmaps: true #Update water pkmaps during refinement
+  TLS: "TLSbasic" #"TLSbasic" turns on TLS refinement and autoncs. Leave blank for no TLS.
   remediate: true #Run SideAide to refit side chains
   sidechainrebuild: true #Allow SideAide to rebuild stubbed sidechains
   runpepflip: true #Run pepflip to check for and correct peptide bond flips
