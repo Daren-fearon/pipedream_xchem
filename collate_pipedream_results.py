@@ -15,7 +15,7 @@ Features:
 - Map file generation from MTZ files using gemmi
 
 Author: DFearon
-Date: July 2025
+Date: October 2025
 """
 
 import os
@@ -36,7 +36,7 @@ from rdkit.Geometry import Point3D
 import gemmi
 
 # Version information
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 # Constants
 MIN_LIGAND_ATOMS = 5
@@ -45,6 +45,14 @@ MIN_MCS_ATOMS = 5
 MAX_DEBUG_FILES_DISPLAY = 5
 LIGAND_CC_THRESHOLD = 0.8
 B_FACTOR_RATIO_THRESHOLD = 1.5
+
+# File name constants
+BEST_PDB_FILENAME = "best.pdb"
+REFINE_PDB_FILENAME = "refine.pdb"
+BEST_CIF_FILENAME = "best.cif"
+REFINE_MTZ_FILENAME = "refine.mtz"
+ELECTRON_DENSITY_GIF_SUFFIX = "electrondensity_movie.gif"
+OUTPUT_SMILES_SUFFIX = "_output_smiles.smiles"
 
 
 def check_gemmi_availability():
@@ -89,7 +97,15 @@ def check_gemmi_availability():
     return False, None
 
 # CIF/PDB handling functions (from compare_chirality.py)
-def load_mol_from_cif(cif_path):
+def load_mol_from_cif(cif_path: str) -> Chem.Mol:
+    """Load a molecule from a CIF file with topology and coordinates.
+    
+    Args:
+        cif_path: Path to the CIF file
+        
+    Returns:
+        RDKit molecule object with 3D coordinates
+    """
     BOND_TYPES = {
         'SING': Chem.BondType.SINGLE, 'SINGLE': Chem.BondType.SINGLE,
         'DOUB': Chem.BondType.DOUBLE, 'DOUBLE': Chem.BondType.DOUBLE,
@@ -143,7 +159,18 @@ def load_mol_from_cif(cif_path):
     Chem.AssignStereochemistryFrom3D(mol)
     return mol
 
-def assign_coordinates_from_pdb(mol, pdb_path, dataset_name="Unknown", structure_type="Unknown"):
+def assign_coordinates_from_pdb(mol: Chem.Mol, pdb_path: str, dataset_name: str = "Unknown", structure_type: str = "Unknown") -> Chem.Mol:
+    """Assign 3D coordinates from a PDB file to a molecule from CIF.
+    
+    Args:
+        mol: RDKit molecule with correct topology
+        pdb_path: Path to PDB file with coordinates
+        dataset_name: Dataset identifier for logging
+        structure_type: Type of structure (input/output) for logging
+        
+    Returns:
+        Molecule with assigned 3D coordinates
+    """
     with open(pdb_path, 'r') as f:
         pdb_block = f.read()
     pdb_mol = Chem.MolFromPDBBlock(pdb_block, removeHs=False)
@@ -208,6 +235,17 @@ def compare_chiral_centers_cif_pdb(input_cif, input_pdb, output_cif, output_pdb,
     """
     Compare stereochemistry using CIF files for topology and PDB files for coordinates.
     This matches the approach used in compare_chirality.py.
+    
+    Args:
+        input_cif: Path to input CIF file (required)
+        input_pdb: Path to input PDB file (optional, can be 'NA' or None)
+        output_cif: Path to output CIF file (required)
+        output_pdb: Path to output PDB file (required)
+        smiles_file: Path to SMILES file (required)
+        dataset_name: Name of the dataset for logging (default: "Unknown")
+        
+    Returns:
+        Tuple of (chirality comparison result, output SMILES string)
     """
     try:
         # Load reference SMILES
@@ -217,8 +255,15 @@ def compare_chiral_centers_cif_pdb(input_cif, input_pdb, output_cif, output_pdb,
         # Process input molecule
         logging.debug(f"Loading input CIF: {input_cif}")
         mol_input = load_mol_from_cif(input_cif)
-        logging.debug(f"Assigning coordinates from input PDB: {input_pdb}")
-        mol_input = assign_coordinates_from_pdb(mol_input, input_pdb, dataset_name, "input")
+        
+        # Assign coordinates from input PDB if available, otherwise use CIF coordinates
+        if input_pdb and input_pdb != 'NA' and os.path.isfile(input_pdb):
+            logging.debug(f"Assigning coordinates from input PDB: {input_pdb}")
+            mol_input = assign_coordinates_from_pdb(mol_input, input_pdb, dataset_name, "input")
+        else:
+            logging.debug(f"No input PDB available, using CIF coordinates for input molecule")
+            # Ensure stereochemistry is assigned from the CIF 3D coordinates
+            Chem.AssignStereochemistryFrom3D(mol_input)
 
         # Process output molecule - use CIF topology + PDB coordinates
         logging.debug(f"Loading output CIF: {output_cif}")
@@ -346,115 +391,6 @@ def _extract_ligand_from_pdb(mol: Chem.Mol) -> Chem.Mol:
     return mol
 
 
-def extract_smiles_from_pdb(output_pdb_path: str, pipedream_dir: str = 'NA', compound_code: str = 'NA') -> str:
-    """
-    Extract SMILES string from the ligand in an output PDB file.
-    Preferentially uses CIF file for bond order information if available.
-    
-    Args:
-        output_pdb_path: Path to the output PDB file containing the ligand
-        pipedream_dir: Pipedream directory path for finding CIF files
-        compound_code: Compound code for finding CIF files
-        
-    Returns:
-        SMILES string of the ligand, or error message if extraction fails
-    """
-    if not os.path.isfile(output_pdb_path):
-        return f"PDB file not found: {output_pdb_path}"
-    
-    try:
-        # First try to use CIF file if available for better bond order information
-        cif_mol = None
-        if pipedream_dir != 'NA' and compound_code != 'NA':
-            cif_dir = os.path.join(pipedream_dir, f"rhofit-{compound_code}")
-            cif_path = os.path.join(cif_dir, "best.cif")
-            
-            if os.path.isfile(cif_path):
-                logging.debug(f"Found CIF file: {cif_path}")
-                try:
-                    # Try different methods to read CIF file
-                    cif_mol = None
-                    
-                    # First try: Standard CIF file reader
-                    try:
-                        cif_mol = Chem.MolFromMolFile(cif_path, removeHs=False)
-                    except:
-                        pass
-                    
-                    # Second try: Read as text and parse as PDB block if standard fails
-                    if cif_mol is None:
-                        with open(cif_path, 'r') as f:
-                            cif_content = f.read()
-                        # Try to extract PDB-like coordinate block from CIF
-                        # This is a fallback that may work for some CIF files
-                        if 'LIG' in cif_content and '_chem_comp_atom' in cif_content:
-                            logging.debug(f"CIF file contains ligand data, attempting extraction")
-                            # For now, skip complex CIF parsing and use PDB fallback
-                            cif_mol = None
-                    
-                    if cif_mol is not None:
-                        logging.debug(f"Successfully loaded molecule from CIF with {cif_mol.GetNumAtoms()} atoms")
-                        # CIF files typically have correct bond orders, so minimal sanitization needed
-                        try:
-                            Chem.SanitizeMol(cif_mol)
-                        except Exception as e:
-                            logging.warning(f"CIF sanitization failed: {e}")
-                            cif_mol = None
-                    else:
-                        logging.warning(f"Failed to parse CIF file: {cif_path}")
-                except Exception as e:
-                    logging.warning(f"Error reading CIF file {cif_path}: {e}")
-        
-        # If CIF worked, use it; otherwise fall back to PDB
-        if cif_mol is not None:
-            ligand_mol = cif_mol
-            logging.debug("Using CIF file for SMILES generation")
-        else:
-            logging.debug("Falling back to PDB file for SMILES generation")
-            # Read the PDB file
-            mol = Chem.MolFromPDBFile(output_pdb_path, removeHs=False)
-            if mol is None:
-                return f"Failed to parse PDB file: {output_pdb_path}"
-            
-            # Extract only the ligand from the PDB
-            ligand_mol = _extract_ligand_from_pdb(mol)
-            
-            # Critical: Sanitize the molecule to correct bond orders and formal charges
-            # This is essential when reading from PDB files where bond orders may be incorrect
-            try:
-                Chem.SanitizeMol(ligand_mol)
-            except Exception as e:
-                logging.warning(f"Sanitization failed for PDB ligand, trying alternative approach: {e}")
-                # Try to fix common PDB issues
-                try:
-                    ligand_mol = Chem.AddHs(ligand_mol)
-                    Chem.SanitizeMol(ligand_mol)
-                    ligand_mol = Chem.RemoveHs(ligand_mol)
-                except Exception as e2:
-                    logging.warning(f"Alternative sanitization also failed: {e2}")
-        
-        # Remove hydrogens before generating SMILES
-        ligand_mol = Chem.RemoveHs(ligand_mol)
-        
-        # Assign stereochemistry with careful handling
-        Chem.AssignStereochemistry(ligand_mol, force=True, cleanIt=True)
-        
-        # Generate SMILES with stereochemistry (hydrogens excluded)
-        # Use canonical SMILES to ensure consistency
-        smiles = Chem.MolToSmiles(ligand_mol, isomericSmiles=True, canonical=True)
-        
-        if not smiles:
-            return "Failed to generate SMILES from ligand"
-        
-        logging.debug(f"Generated SMILES from {'CIF' if cif_mol is not None else 'PDB'}: {smiles}")
-        return smiles
-        
-    except Exception as e:
-        logging.error(f"Error extracting SMILES from structure files: {e}")
-        return f"Error extracting SMILES: {e}"
-
-
-
 def save_output_smiles_with_analysis(output_mol, compound_code, pipedream_dir, chirality_result="Not analyzed", input_smiles=""):
     """
     Save output SMILES with chirality analysis results to the specific pipedream run directory.
@@ -477,9 +413,8 @@ def save_output_smiles_with_analysis(output_mol, compound_code, pipedream_dir, c
         # Generate canonical isomeric SMILES
         output_smiles = Chem.MolToSmiles(mol_no_h, isomericSmiles=True, canonical=True)
         
-        # Create simple filename
-        smiles_filename = f"{compound_code}_output_smiles.smiles"
-        output_path = os.path.join(pipedream_dir, smiles_filename)
+        # Create output path using helper function
+        output_path = get_output_smiles_path(pipedream_dir, compound_code)
             
         # Write file with comprehensive metadata
         with open(output_path, "w", encoding="utf-8") as f:
@@ -623,7 +558,7 @@ def detect_chiral_inversion(input_smi_path: str, output_pdb_path: str, input_pdb
             try:
                 with open(input_smi_path, 'r', encoding='utf-8') as f:
                     input_smiles_for_metadata = f.readline().strip().split()[0]
-            except:
+            except (IOError, IndexError, OSError):
                 pass
         
         updated_smiles = Chem.MolToSmiles(output_mol_no_h, isomericSmiles=True, canonical=True)
@@ -856,6 +791,67 @@ def build_file_path(base_dir: str, relative_path: str, filename: str) -> str:
     return os.path.join(base_dir, relative_path or '', filename or '')
 
 
+def get_output_smiles_path(pipedream_dir: str, compound_code: str) -> str:
+    """Construct the standard path for output SMILES files.
+    
+    Args:
+        pipedream_dir: Pipedream output directory
+        compound_code: Compound identifier
+        
+    Returns:
+        Full path to output SMILES file
+    """
+    if pipedream_dir == 'NA' or compound_code == 'NA':
+        return 'NA'
+    return os.path.join(pipedream_dir, f"{compound_code}{OUTPUT_SMILES_SUFFIX}")
+
+
+def find_input_files(input_dir: str, compound_code: str) -> dict:
+    """Find input structure files (SMILES, PDB, CIF) in the input directory.
+    
+    Args:
+        input_dir: Directory containing input files
+        compound_code: Compound identifier
+        
+    Returns:
+        Dictionary with keys 'smiles', 'pdb', 'cif' containing file paths or 'NA'
+    """
+    result = {'smiles': 'NA', 'pdb': 'NA', 'cif': 'NA'}
+    
+    if input_dir == 'NA' or not os.path.isdir(input_dir) or compound_code == 'NA':
+        return result
+    
+    # Look for SMILES file
+    potential_smi_path = os.path.join(input_dir, f"{compound_code}.smiles")
+    if os.path.isfile(potential_smi_path):
+        result['smiles'] = potential_smi_path
+    else:
+        # List available files for debugging
+        try:
+            available_files = [f for f in os.listdir(input_dir) 
+                             if f.endswith(('.smiles', '.smi', '.pdb', '.cif'))]
+            if available_files:
+                truncated_files = available_files[:MAX_DEBUG_FILES_DISPLAY]
+                ellipsis = '...' if len(available_files) > MAX_DEBUG_FILES_DISPLAY else ''
+                logging.warning(f"SMILES file not found. Available files: {truncated_files}{ellipsis}")
+        except (OSError, PermissionError):
+            pass
+    
+    # Look for input PDB file
+    potential_pdb_path = os.path.join(input_dir, f"{compound_code}.pdb")
+    if os.path.isfile(potential_pdb_path):
+        result['pdb'] = potential_pdb_path
+        logging.debug(f"Found input PDB: {result['pdb']}")
+    
+    # Look for input CIF file
+    potential_cif_path = os.path.join(input_dir, f"{compound_code}.cif")
+    if os.path.isfile(potential_cif_path):
+        result['cif'] = potential_cif_path
+        logging.debug(f"Found input CIF: {result['cif']}")
+    
+    return result
+
+
 def convert_mtz_to_map(mtz_file_path: str, map_type: str = '2fofc') -> str:
     """Convert an MTZ file to a map file using gemmi, if not already present."""
     if mtz_file_path == 'NA':
@@ -977,10 +973,22 @@ def build_result(
 
 def collect_results_from_json(json_data: dict) -> List[Dict[str, Any]]:
     """Collect results from the JSON data for all datasets."""
+    # Input validation
+    if not json_data:
+        logging.warning("No data provided to collect_results_from_json")
+        return []
+    
     results = []
     total_datasets = len(json_data)
     logging.info(f"Processing {total_datasets} datasets")
     print(f"Processing {total_datasets} datasets...")  # Console progress
+    
+    # Check gemmi availability once for all datasets (not per dataset)
+    gemmi_available, gemmi_cmd = check_gemmi_availability()
+    if gemmi_available:
+        logging.info("gemmi is available for map generation")
+    else:
+        logging.info("gemmi not available, map generation will be skipped")
     
     for i, (dataset, info) in enumerate(json_data.items(), 1):
         logging.info(f"Processing dataset {i}/{total_datasets}: {dataset}")
@@ -1011,27 +1019,42 @@ def collect_results_from_json(json_data: dict) -> List[Dict[str, Any]]:
                 high_resolution = f"{float(high_resolution):.2f}"
             except (ValueError, TypeError):
                 high_resolution = 'NA'
+        
+        # Extract validation statistics
         ligand = safe_get(summary, ['ligandfitting', 'ligands', 0])
         ligand_stats = safe_get(ligand, ['validationstatistics', 'ligandstatistics', 0])
         molprobity_stats = safe_get(ligand, ['validationstatistics', 'molprobity'])
         postrefinement_stats = safe_get(ligand, ['postrefinement', 1])
-        # Extract PDB, MTZ, and CIF file paths
+        
+        # Extract key directory and compound information ONCE
+        pipedream_dir = info.get('PipedreamDirectory', 'NA')
+        compound_code = info.get('CompoundCode', 'NA')
+        input_dir = info.get('Input_dir', 'NA')
+        
+        # Use compound_code or fallback to dataset name
+        if compound_code == 'NA':
+            compound_code = dataset
+        
+        logging.debug(f"Dataset: {dataset}, Compound: {compound_code}")
+        
+        # Initialize file path variables
         pdb_file = 'NA'
         mtz_file = 'NA'
         input_cif_file = 'NA'
         output_cif_file = 'NA'
         
-        pipedream_dir = info.get('PipedreamDirectory', 'NA')
-        compound_code = info.get('CompoundCode', 'NA')
+        # Construct common directory paths once
+        has_valid_paths = pipedream_dir != 'NA' and compound_code != 'NA'
+        if has_valid_paths:
+            rhofit_dir = os.path.join(pipedream_dir, f"rhofit-{compound_code}")
+            postrefine_dir = os.path.join(pipedream_dir, f'postrefine-{compound_code}')
+            report_dir = os.path.join(pipedream_dir, f'report-{compound_code}')
         
         # Primary method: Use direct path construction for output files
-        if pipedream_dir != 'NA' and compound_code != 'NA':
-            rhofit_dir = os.path.join(pipedream_dir, f"rhofit-{compound_code}")
-            
+        if has_valid_paths:
             # Check for output PDB and CIF files in rhofit directory
-            potential_output_pdb = os.path.join(rhofit_dir, "best.pdb")  # For chirality analysis
-            potential_refine_pdb = os.path.join(rhofit_dir, "refine.pdb")  # For display
-            potential_output_cif = os.path.join(rhofit_dir, "best.cif")
+            potential_refine_pdb = os.path.join(rhofit_dir, REFINE_PDB_FILENAME)  # For display
+            potential_output_cif = os.path.join(rhofit_dir, BEST_CIF_FILENAME)
             
             # Use refine.pdb for the PDB File column (display purposes)
             if os.path.isfile(potential_refine_pdb):
@@ -1052,14 +1075,14 @@ def collect_results_from_json(json_data: dict) -> List[Dict[str, Any]]:
                     if entry.get('description') == 'final':
                         if entry.get('type') == 'model' and entry.get('format') == 'PDB' and pdb_file == 'NA':
                             pdb_file = build_file_path(
-                                info.get('PipedreamDirectory', 'NA'),
+                                pipedream_dir,
                                 entry.get('relative_path', ''),
                                 entry.get('filename', '')
                             )
                             logging.debug(f"Found PDB file via JSON: {pdb_file}")
                         elif entry.get('type') == 'model' and entry.get('format') == 'CIF' and output_cif_file == 'NA':
                             output_cif_file = build_file_path(
-                                info.get('PipedreamDirectory', 'NA'),
+                                pipedream_dir,
                                 entry.get('relative_path', ''),
                                 entry.get('filename', '')
                             )
@@ -1067,7 +1090,7 @@ def collect_results_from_json(json_data: dict) -> List[Dict[str, Any]]:
                     elif entry.get('description') == 'input':
                         if entry.get('type') == 'model' and entry.get('format') == 'CIF':
                             input_cif_file = build_file_path(
-                                info.get('PipedreamDirectory', 'NA'),
+                                pipedream_dir,
                                 entry.get('relative_path', ''),
                                 entry.get('filename', '')
                             )
@@ -1075,119 +1098,69 @@ def collect_results_from_json(json_data: dict) -> List[Dict[str, Any]]:
             else:
                 logging.debug(f"No postrefinement entries found or not a list: {type(postrefinement)}")
         
-        # Directly find output mtz file
-        pipedream_dir = info.get('PipedreamDirectory', 'NA')
-        compound_code = info.get('CompoundCode', 'NA')
-        if pipedream_dir != 'NA' and compound_code != 'NA':
-            mtz_file = os.path.join(pipedream_dir, f'postrefine-{compound_code}', 'refine.mtz')
+        # Enhanced PDB/CIF file logging
+        if pdb_file == 'NA':
+            logging.warning(f"No output PDB file found for dataset {dataset}")
+        if output_cif_file == 'NA':
+            logging.warning(f"No output CIF file found for dataset {dataset}")
+        
+        # Find output MTZ file
+        if has_valid_paths:
+            mtz_file = os.path.join(postrefine_dir, REFINE_MTZ_FILENAME)
             if not os.path.isfile(mtz_file):
-                logging.warning(f"MTZ file not found at expected location: {mtz_file}")
+                logging.warning(f"MTZ file not found for dataset {dataset} at: {mtz_file}")
                 mtz_file = 'NA'
-        else:
-            mtz_file = 'NA'
         
-        # Generate map files if MTZ file is valid
-        logging.debug(f"Attempting map generation for MTZ file: {mtz_file}")
-        
-        # Check if gemmi is available first
-        gemmi_available, gemmi_cmd = check_gemmi_availability()
-        
+        # Generate map files if MTZ file is valid and gemmi available
         if gemmi_available and mtz_file != 'NA':
-            logging.debug(f"gemmi is available, proceeding with map generation for {mtz_file}")
+            logging.debug(f"Generating map files for: {mtz_file}")
             map_2fofc_file = convert_mtz_to_map(mtz_file, '2fofc')
             map_fofc_file = convert_mtz_to_map(mtz_file, 'fofc')
             logging.debug(f"Map generation results: 2fofc={map_2fofc_file}, fofc={map_fofc_file}")
         else:
             map_2fofc_file = 'NA'
             map_fofc_file = 'NA'
-            if not gemmi_available:
-                logging.debug("gemmi not available, skipping map generation")
-            else:
-                logging.debug("No MTZ file available, skipping map generation")
         
         # Find electron density movie gif
         electron_density_gif = 'NA'
-        pipedream_dir = info.get('PipedreamDirectory', 'NA')
-        compound_code = info.get('CompoundCode', 'NA')
-        if pipedream_dir != 'NA' and compound_code != 'NA':
-            gif_dir = os.path.join(pipedream_dir, f'report-{compound_code}', 'ligand', 'pictures')
+        if has_valid_paths:
+            gif_dir = os.path.join(report_dir, 'ligand', 'pictures')
             if os.path.isdir(gif_dir):
                 for fname in os.listdir(gif_dir):
-                    if fname.endswith('electrondensity_movie.gif'):
+                    if fname.endswith(ELECTRON_DENSITY_GIF_SUFFIX):
                         electron_density_gif = os.path.join(gif_dir, fname)
                         break
         
-        # Chirality flip detection - use compound_code or fallback to dataset
-        if compound_code == 'NA':
-            compound_code = dataset
-        input_dir = info.get('Input_dir', 'NA')
+        # Find input files in the input directory
+        input_files = find_input_files(input_dir, compound_code)
+        input_smi_path = input_files['smiles']
+        input_pdb_path = input_files['pdb']
+        input_cif_path = input_files['cif']
         
-        # Enhanced diagnostic logging for file paths
-        logging.debug(f"Dataset: {dataset}, Compound: {compound_code}")
-        
-        # Construct paths to input files in the input directory
-        input_smi_path = 'NA'
-        input_pdb_path = 'NA' 
-        input_cif_path = 'NA'
-        
-        if input_dir != 'NA' and os.path.isdir(input_dir) and compound_code != 'NA':
-            # Look for SMILES file
-            potential_smi_path = os.path.join(input_dir, f"{compound_code}.smiles")
-            if os.path.isfile(potential_smi_path):
-                input_smi_path = potential_smi_path
-            else:
-                # List available files for debugging
-                try:
-                    available_files = [f for f in os.listdir(input_dir) if f.endswith(('.smiles', '.smi', '.pdb', '.cif'))]
-                    if available_files:
-                        truncated_files = available_files[:MAX_DEBUG_FILES_DISPLAY]
-                        ellipsis = '...' if len(available_files) > MAX_DEBUG_FILES_DISPLAY else ''
-                        logging.warning(f"SMILES file not found. Available files: {truncated_files}{ellipsis}")
-                except (OSError, PermissionError):
-                    pass
-                    
-            # Look for input PDB file  
-            potential_pdb_path = os.path.join(input_dir, f"{compound_code}.pdb")
-            if os.path.isfile(potential_pdb_path):
-                input_pdb_path = potential_pdb_path
-                logging.debug(f"Found input PDB: {input_pdb_path}")
-                
-            # Look for input CIF file
-            potential_cif_path = os.path.join(input_dir, f"{compound_code}.cif")
-            if os.path.isfile(potential_cif_path):
-                input_cif_path = potential_cif_path
-                logging.debug(f"Found input CIF: {input_cif_path}")
-            
-        # Enhanced PDB file logging
-        if pdb_file == 'NA':
-            logging.warning(f"No output PDB file found for dataset {dataset}")
-        if output_cif_file == 'NA':
-            logging.warning(f"No output CIF file found for dataset {dataset}")
-            
         # Define PDB file for chirality analysis (only use best.pdb - no fallback)
         chirality_pdb_file = 'NA'
-        if pipedream_dir != 'NA' and compound_code != 'NA':
-            best_pdb_path = os.path.join(pipedream_dir, f"rhofit-{compound_code}", "best.pdb")
+        if has_valid_paths:
+            best_pdb_path = os.path.join(rhofit_dir, BEST_PDB_FILENAME)
             if os.path.isfile(best_pdb_path):
                 chirality_pdb_file = best_pdb_path
-                logging.debug(f"Using best.pdb for chirality analysis: {chirality_pdb_file}")
+                logging.debug(f"Using {BEST_PDB_FILENAME} for chirality analysis: {chirality_pdb_file}")
             else:
-                logging.debug(f"best.pdb not found, chirality analysis will be skipped")
-        else:
-            logging.debug(f"Pipedream directory or compound code not available, chirality analysis will be skipped")
-            
+                logging.debug(f"{BEST_PDB_FILENAME} not found for dataset {dataset}, chirality analysis will be skipped")
+        
+        # Perform chirality analysis
         # Always prioritize using CIF input file when available
         # Input: Must have CIF (PDB optional), Output: Must have both CIF and PDB
         if (input_cif_path != 'NA' and output_cif_file != 'NA' and 
             chirality_pdb_file != 'NA' and input_smi_path != 'NA'):
             
-            logging.debug(f"Using CIF+PDB approach for chirality analysis of {dataset} (input CIF required, output CIF+PDB available)")
+            logging.debug(f"Using CIF+PDB approach for chirality analysis of {dataset}")
             chirality_flip, updated_smiles = compare_chiral_centers_cif_pdb(
                 input_cif_path, input_pdb_path, output_cif_file, chirality_pdb_file, input_smi_path, dataset)
             
             # Save SMILES analysis file
-            if pipedream_dir != 'NA' and compound_code != 'NA':
-                smiles_file_path = os.path.join(pipedream_dir, f"{compound_code}_output_smiles.smiles")
+            updated_smiles_file = 'NA'
+            if has_valid_paths:
+                smiles_file_path = get_output_smiles_path(pipedream_dir, compound_code)
                 try:
                     with open(smiles_file_path, 'w') as f:
                         f.write(f"# Chirality analysis results\n")
@@ -1199,9 +1172,6 @@ def collect_results_from_json(json_data: dict) -> List[Dict[str, Any]]:
                     logging.debug(f"Saved SMILES analysis to: {smiles_file_path}")
                 except Exception as e:
                     logging.error(f"Error saving SMILES file: {e}")
-                    updated_smiles_file = 'NA'
-            else:
-                updated_smiles_file = 'NA'
                 
         # Fallback to original SMILES+PDB approach if CIF requirements not met
         elif input_smi_path != 'NA' and chirality_pdb_file != 'NA':
@@ -1211,15 +1181,14 @@ def collect_results_from_json(json_data: dict) -> List[Dict[str, Any]]:
             if output_cif_file == 'NA':
                 missing_cif_info.append("output CIF")
             
-            logging.debug(f"CIF requirements not met (missing: {', '.join(missing_cif_info)}), using fallback SMILES+PDB approach for chirality analysis of {dataset}")
+            logging.debug(f"CIF requirements not met (missing: {', '.join(missing_cif_info)}), using fallback SMILES+PDB approach for {dataset}")
             chirality_flip, updated_smiles = detect_chiral_inversion(input_smi_path, chirality_pdb_file, input_pdb_path, pipedream_dir, compound_code)
             
             # Construct expected path to analysis file
-            if pipedream_dir != 'NA' and compound_code != 'NA':
-                expected_smiles_file = os.path.join(pipedream_dir, f"{compound_code}_output_smiles.smiles")
+            updated_smiles_file = 'NA'
+            if has_valid_paths:
+                expected_smiles_file = get_output_smiles_path(pipedream_dir, compound_code)
                 updated_smiles_file = expected_smiles_file if os.path.exists(expected_smiles_file) else 'NA'
-            else:
-                updated_smiles_file = 'NA'
             
         else:
             missing_info = []
