@@ -17,7 +17,7 @@ Features:
 - Copies BUSTER output files for downstream analysis
 
 Author: DFearon
-Date: July 2025
+Date: October 2025
 """
 
 import os
@@ -32,7 +32,7 @@ import logging
 from datetime import datetime
 
 # Version information
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 # Import RDKit for PNG generation
 try:
@@ -171,9 +171,99 @@ def generate_png_from_smiles(smiles, output_path):
         logging.error(f"Error generating PNG from SMILES '{smiles}': {e}")
         return False
 
-# Function to handle chirality changes
-def handle_chirality_change(crystal, compound_code, entry, yaml_params, pipedream_dir, new_smiles, cursor, user, db_timestamp):
-    """Handle file copying and database updates for chirality changes."""
+# Helper function to safely copy files
+def safe_copy_file(src, dst, crystal_name):
+    """Copy file to dst using a temp-file-and-rename strategy to avoid partial writes
+    and to provide clearer logging/fallbacks when permission errors occur."""
+    try:
+        if not src or not os.path.exists(src):
+            raise FileNotFoundError(src)
+
+        dst_dir = os.path.dirname(dst)
+        os.makedirs(dst_dir, exist_ok=True)
+
+        # Copy to a temporary file in the destination directory then rename
+        tmp_dst = dst + ".tmp"
+        if os.path.exists(tmp_dst):
+            try:
+                os.remove(tmp_dst)
+            except Exception:
+                pass
+
+        shutil.copy2(src, tmp_dst)
+        # Ensure file permissions are reasonable (rw-r--r--)
+        try:
+            os.chmod(tmp_dst, 0o644)
+        except Exception:
+            # Not critical; may fail on some filesystems
+            pass
+
+        # Atomic move
+        os.replace(tmp_dst, dst)
+        log_crystal_progress(crystal_name, f"copied file {src} -> {dst} (atomic)")
+        return True
+
+    except PermissionError as pe:
+        logging.error(f"Permission error copying {src} to {dst}: {pe}")
+        # Fallback: try a direct copy without temp if allowed
+        try:
+            shutil.copy2(src, dst)
+            log_crystal_progress(crystal_name, f"copied file {src} -> {dst} (fallback)")
+            return True
+        except Exception as e:
+            logging.error(f"Fallback copy also failed for {src} -> {dst}: {e}")
+            return False
+    except FileNotFoundError:
+        logging.warning(f"Source file not found: {src}")
+        return False
+    except Exception as e:
+        logging.error(f"Error copying {src} to {dst}: {e}")
+        return False
+
+# Helper function to safely write text files
+def safe_write_text_file(path, text, crystal_name):
+    """Write text to file using atomic write strategy."""
+    try:
+        dst_dir = os.path.dirname(path)
+        os.makedirs(dst_dir, exist_ok=True)
+        tmp_path = path + ".tmp"
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            f.write(text)
+        try:
+            os.chmod(tmp_path, 0o644)
+        except Exception:
+            pass
+        os.replace(tmp_path, path)
+        log_crystal_progress(crystal_name, f"wrote text file {path} (atomic)")
+        return True
+    except PermissionError as pe:
+        logging.error(f"Permission error writing {path}: {pe}")
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(text)
+            log_crystal_progress(crystal_name, f"wrote text file {path} (fallback)")
+            return True
+        except Exception as e:
+            logging.error(f"Fallback write failed for {path}: {e}")
+            return False
+    except Exception as e:
+        logging.error(f"Error writing file {path}: {e}")
+        return False
+
+# Function to export restraints files to compound directory
+def export_restraints_files(crystal, compound_code, entry, yaml_params, pipedream_dir):
+    """Export CIF and PDB restraint files to the compound directory for all datasets.
+    
+    Args:
+        crystal: Crystal name
+        compound_code: Compound code
+        entry: JSON entry with refinement information
+        yaml_params: YAML parameters dictionary
+        pipedream_dir: Path to Pipedream output directory
+        
+    Returns:
+        tuple: (cif_path, pdb_path) of exported files, or (None, None) on failure
+    """
     
     # Construct compound directory path
     compound_dir = os.path.join(yaml_params["Processing_directory"], "analysis", "model_building", crystal, "compound")
@@ -186,12 +276,9 @@ def handle_chirality_change(crystal, compound_code, entry, yaml_params, pipedrea
     # Define target file paths in compound directory
     target_cif = os.path.join(compound_dir, f"{compound_code}.cif")
     target_pdb = os.path.join(compound_dir, f"{compound_code}.pdb")
-    target_png = os.path.join(compound_dir, f"{compound_code}.png")
-    target_smiles = os.path.join(compound_dir, f"{compound_code}.smiles")
     
-    # Define symlink paths in crystal directory
+    # Define symlink path for CIF in crystal directory
     symlink_cif = os.path.join(crystal_dir, f"{compound_code}.cif")
-    symlink_png = os.path.join(crystal_dir, f"{compound_code}.png")
     
     try:
         # Get source files from Pipedream output
@@ -255,64 +342,21 @@ def handle_chirality_change(crystal, compound_code, entry, yaml_params, pipedrea
             logging.warning(f"Could not find output CIF file for {compound_code} in {crystal}")
             log_crystal_progress(crystal, f"WARNING - no output CIF file found for {compound_code}")
         
-        # Copy new restraint files to compound directory (forcefully overwrite)
-        def safe_copy_file(src, dst, crystal_name):
-            """Copy file to dst using a temp-file-and-rename strategy to avoid partial writes
-            and to provide clearer logging/fallbacks when permission errors occur."""
-            try:
-                if not src or not os.path.exists(src):
-                    raise FileNotFoundError(src)
-
-                dst_dir = os.path.dirname(dst)
-                os.makedirs(dst_dir, exist_ok=True)
-
-                # Copy to a temporary file in the destination directory then rename
-                tmp_dst = dst + ".tmp"
-                if os.path.exists(tmp_dst):
-                    try:
-                        os.remove(tmp_dst)
-                    except Exception:
-                        pass
-
-                shutil.copy2(src, tmp_dst)
-                # Ensure file permissions are reasonable (rw-r--r--)
-                try:
-                    os.chmod(tmp_dst, 0o644)
-                except Exception:
-                    # Not critical; may fail on some filesystems
-                    pass
-
-                # Atomic move
-                os.replace(tmp_dst, dst)
-                log_crystal_progress(crystal_name, f"copied file {src} -> {dst} (atomic)")
-                return True
-
-            except PermissionError as pe:
-                logging.error(f"Permission error copying {src} to {dst}: {pe}")
-                # Fallback: try a direct copy without temp if allowed
-                try:
-                    shutil.copy2(src, dst)
-                    log_crystal_progress(crystal_name, f"copied file {src} -> {dst} (fallback)")
-                    return True
-                except Exception as e:
-                    logging.error(f"Fallback copy also failed for {src} -> {dst}: {e}")
-                    return False
-            except FileNotFoundError:
-                logging.warning(f"Source file not found: {src}")
-                return False
-            except Exception as e:
-                logging.error(f"Error copying {src} to {dst}: {e}")
-                return False
-
-        # Use safe_copy_file for PDB and CIF
+        # Copy restraint files to compound directory
+        cif_copied = False
+        pdb_copied = False
+        
         if refined_pdb_file and os.path.exists(refined_pdb_file):
-            if not safe_copy_file(refined_pdb_file, target_pdb, crystal):
+            if safe_copy_file(refined_pdb_file, target_pdb, crystal):
+                pdb_copied = True
+            else:
                 logging.warning(f"Refined PDB file copy failed: {refined_pdb_file} -> {target_pdb}")
         else:
             logging.warning(f"Refined PDB file not found: {refined_pdb_file}")
 
         if output_cif_file and os.path.exists(output_cif_file):
             if safe_copy_file(output_cif_file, target_cif, crystal):
+                cif_copied = True
                 # Create/update symlink to CIF in crystal directory
                 safe_symlink(target_cif, symlink_cif)
                 log_crystal_progress(crystal, f"updated CIF symlink {target_cif} -> {symlink_cif}")
@@ -321,35 +365,36 @@ def handle_chirality_change(crystal, compound_code, entry, yaml_params, pipedrea
         else:
             logging.warning(f"Output CIF file not found: {output_cif_file}")
         
-        # Save new SMILES to file (atomic write)
-        def safe_write_text_file(path, text, crystal_name):
-            try:
-                dst_dir = os.path.dirname(path)
-                os.makedirs(dst_dir, exist_ok=True)
-                tmp_path = path + ".tmp"
-                with open(tmp_path, 'w', encoding='utf-8') as f:
-                    f.write(text)
-                try:
-                    os.chmod(tmp_path, 0o644)
-                except Exception:
-                    pass
-                os.replace(tmp_path, path)
-                log_crystal_progress(crystal_name, f"wrote text file {path} (atomic)")
-                return True
-            except PermissionError as pe:
-                logging.error(f"Permission error writing {path}: {pe}")
-                try:
-                    with open(path, 'w', encoding='utf-8') as f:
-                        f.write(text)
-                    log_crystal_progress(crystal_name, f"wrote text file {path} (fallback)")
-                    return True
-                except Exception as e:
-                    logging.error(f"Fallback write failed for {path}: {e}")
-                    return False
-            except Exception as e:
-                logging.error(f"Error writing file {path}: {e}")
-                return False
+        return (target_cif if cif_copied else None, target_pdb if pdb_copied else None)
+        
+    except Exception as e:
+        logging.error(f"Error exporting restraints files for crystal {crystal}: {e}")
+        log_crystal_progress(crystal, f"ERROR exporting restraints files: {e}")
+        return (None, None)
 
+# Function to handle chirality changes
+def handle_chirality_change(crystal, compound_code, entry, yaml_params, pipedream_dir, new_smiles, cursor, user, db_timestamp):
+    """Handle SMILES update, PNG regeneration, and database updates for chirality changes.
+    Note: Restraints files are now exported separately for all datasets via export_restraints_files().
+    """
+    
+    # Construct compound directory path
+    compound_dir = os.path.join(yaml_params["Processing_directory"], "analysis", "model_building", crystal, "compound")
+    crystal_dir = os.path.join(yaml_params["Processing_directory"], "analysis", "model_building", crystal)
+    
+    # Create compound directory if it doesn't exist
+    os.makedirs(compound_dir, exist_ok=True)
+    log_crystal_progress(crystal, f"ensured compound directory exists {compound_dir}")
+    
+    # Define target file paths in compound directory
+    target_png = os.path.join(compound_dir, f"{compound_code}.png")
+    target_smiles = os.path.join(compound_dir, f"{compound_code}.smiles")
+    
+    # Define symlink path for PNG in crystal directory
+    symlink_png = os.path.join(crystal_dir, f"{compound_code}.png")
+    
+    try:
+        # Handle SMILES update and PNG regeneration for chirality changes
         if new_smiles and new_smiles != "NA":
             if safe_write_text_file(target_smiles, new_smiles, crystal):
                 log_crystal_progress(crystal, f"saved new SMILES to {target_smiles}")
@@ -571,7 +616,7 @@ def main():
             else:
                 log_crystal_progress(crystal, f"missing Pipedream directory or compound code for SMILES extraction")
             
-            # Handle chirality change (copy files, update database, generate PNG)
+            # Handle chirality change (SMILES update, PNG regeneration, database update)
             if handle_chirality_change(crystal, compound_code, entry, yaml_params, entry.get("Pipedream Directory", ""), new_smiles, cursor, user, db_timestamp):
                 log_crystal_progress(crystal, f"chirality change handling completed successfully")
             else:
@@ -582,6 +627,12 @@ def main():
         try:
             pipedream_dir = entry["Pipedream Directory"]
             target_dir = os.path.join(yaml_params["Processing_directory"], "analysis", "model_building", crystal)
+            
+            # Export restraints files (CIF and PDB) to compound directory for ALL datasets
+            logging.info(f"Exporting restraints files for crystal {crystal}")
+            log_crystal_progress(crystal, f"exporting restraints files to compound directory")
+            export_restraints_files(crystal, compound_code, entry, yaml_params, pipedream_dir)
+            log_crystal_progress(crystal, f"restraints files export completed")
             os.makedirs(target_dir, exist_ok=True)
             
             log_crystal_progress(crystal, f"creating target directory {target_dir}")
