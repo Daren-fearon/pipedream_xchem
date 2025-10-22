@@ -6,7 +6,7 @@ generated from SMILES using grade2. It processes crystallographic datasets
 from an SQLite database and prepares them for automated refinement.
 
 Author: DFearon
-Date: July 2025
+Date: October 2025
 """
 
 import os
@@ -27,7 +27,7 @@ from typing import Dict, List, Optional, Tuple, Any
 CLUSTER_BASTION = "wilson.diamond.ac.uk"
 CLUSTER_USER = os.environ.get("CLUSTER_USER", os.getlogin())
 MAX_CONCURRENT_JOBS = 100
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 
 def setup_logging(log_dir: str = None, log_level: str = "INFO", verbose: bool = False) -> None:
@@ -243,7 +243,7 @@ def read_yaml(yaml_file: str) -> Dict[str, Any]:
 def validate_params(params: Dict[str, Any]) -> None:
     """Validate required parameters in the configuration."""
     required_keys = ['Database_path', 'Mode', 'Processing_directory', 'Refinement_parameters']
-    refinement_keys = ['keepwater', 'mrefine', 'remediate', 'sidechainrebuild', 'runpepflip', 'rhocommands']
+    refinement_keys = ['keepwater', 'TLS', 'remediate', 'sidechainrebuild', 'runpepflip', 'rhocommands']
 
     for key in required_keys:
         if key not in params:
@@ -638,10 +638,26 @@ def refinement_params_to_args(
     If rhofit_file and rhocommands are provided, include them as well.
     Automatically prepends a dash to each rhocommand if not present, and ensures correct command line for -rhocommands.
     Handles both single and multiple rhocommands robustly.
+    Special handling: TLS and WaterUpdatePkmaps values are combined into a single -mrefine flag.
     """
     args = []
+    
+    # Build -mrefine flag with TLS and optionally WaterUpdatePkmaps
+    tls_value = refinement_params.get('TLS', '')
+    water_update_pkmaps = refinement_params.get('WaterUpdatePkmaps', False)
+    
+    # Handle -mrefine flag specially (combines TLS and WaterUpdatePkmaps)
+    if tls_value or water_update_pkmaps:
+        mrefine_parts = []
+        if tls_value:
+            mrefine_parts.append(str(tls_value).strip())
+        if water_update_pkmaps:
+            mrefine_parts.append('WaterUpdatePkmaps')
+        if mrefine_parts:
+            args.append(f"-mrefine {','.join(mrefine_parts)}")
+    
     for key, value in refinement_params.items():
-        if key == 'rhocommands':
+        if key in ['rhocommands', 'WaterUpdatePkmaps', 'TLS']:
             continue  # handled separately
         if isinstance(value, bool):
             if value:
@@ -817,15 +833,16 @@ else
   exit 6
 fi
 
-# Use the full command from the CSV (already quoted as needed)
-CMD="$PipedreamCommand"
+# Use the full command from the CSV
+# Remove any surrounding quotes that might have been added during CSV parsing
+CMD=$(echo "$PipedreamCommand" | sed 's/^"//;s/"$//')
 
 # Collapse multiple spaces to a single space
 CMD=$(echo "$CMD" | tr -s ' ')
 
 # Run Pipedream (this will create the output dir)
-echo "$CMD"
-eval "$CMD"
+echo "Running command: $CMD"
+eval $CMD
 
 # Move any __*.setvar.lis files to array_logs dir for tidiness
 if compgen -G "__*.setvar.lis" > /dev/null; then
