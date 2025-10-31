@@ -188,13 +188,13 @@ python /dls/science/groups/i04-1/software/pipedream_xchem/pipedream_xchem.py --p
 
 ```bash
 # Standard run
-python pipedream_xchem.py --parameters params.yaml
+python /dls/science/groups/i04-1/software/pipedream_xchem/pipedream_xchem.py --parameters params.yaml
 
 # Test run with detailed output
-python pipedream_xchem.py --parameters params.yaml --dry-run --verbose
+python /dls/science/groups/i04-1/software/pipedream_xchem/pipedream_xchem.py --parameters params.yaml --dry-run --verbose
 
 # Custom output locations
-python pipedream_xchem.py --parameters params.yaml --output-json /path/to/output.json --output-csv /path/to/datasets.csv
+python /dls/science/groups/i04-1/software/pipedream_xchem/pipedream_xchem.py --parameters params.yaml --output-json /path/to/output.json --output-csv /path/to/datasets.csv
 ```
 
 #### What It Does
@@ -282,7 +282,7 @@ CrystalName/
 ### Step 2: Collate Results
 
 ```bash
-python collate_pipedream_results.py --input /path/to/<Pipedream_yyyymmdd_hhmmss>_output.json [OPTIONS]
+python /dls/science/groups/i04-1/software/pipedream_xchem/collate_pipedream_results.py --input /path/to/<Pipedream_yyyymmdd_hhmmss>_output.json [OPTIONS]
 ```
 
 #### Command-Line Options
@@ -324,7 +324,7 @@ This script:
 ### Step 3: Export to XCE
 
 ```bash
-python export_pipedream.py --input /path/to/results.json --parameters /path/to/pipedream_parameters.yaml [OPTIONS]
+python /dls/science/groups/i04-1/software/pipedream_xchem/export_pipedream.py --input /path/to/results.json --parameters /path/to/pipedream_parameters.yaml [OPTIONS]
 ```
 
 #### Command-Line Options
