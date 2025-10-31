@@ -69,22 +69,7 @@ ssh-keygen -t rsa -b 4096
 ### 2. Copy Public Key to Wilson
 
 ```bash
-# Automated method (recommended)
-cat ~/.ssh/id_rsa.pub | ssh wilson.diamond.ac.uk "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
-```
-
-Or manually:
-
-```bash
-# 1. Display your public key
-cat ~/.ssh/id_rsa.pub
-
-# 2. SSH to wilson and add it to authorized_keys
-ssh wilson.diamond.ac.uk
-mkdir -p ~/.ssh && chmod 700 ~/.ssh
-echo "paste_your_public_key_here" >> ~/.ssh/authorized_keys
-chmod 600 ~/.ssh/authorized_keys
-exit
+touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
 ```
 
 ### 3. Test Your Connection
