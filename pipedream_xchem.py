@@ -471,21 +471,19 @@ def submit_jobs(
     output_csv_path: Optional[str] = None, 
     dry_run: bool = False,
     log_level: str = "INFO",
-    verbose: bool = False  # ← Add verbose parameter
+    verbose: bool = False
 ) -> Tuple[str, int, str]:
     """Prepares input files and directories for each dataset."""
     try:
-        print("\nPreparing input files and directories for each dataset...")
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_base = params.get('Output_directory') or params['Processing_directory']
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         parent_dir = params.get('Output_directory') or f"{params['Processing_directory']}/analysis/Pipedream/Pipedream_{timestamp}"
         os.makedirs(parent_dir, exist_ok=True)
 
-        # Use the verbose parameter passed from args
-        setup_logging(log_dir=parent_dir, log_level=log_level, verbose=verbose)  # ← Use verbose param
-        logging.info(f"Pipedream XChem v{VERSION} starting")
-        logging.info(f"Command: {' '.join(sys.argv)}")
+        # setup_logging(log_dir=parent_dir, log_level=log_level, verbose=verbose)
 
+        logging.info(f"Processing {len(datasets)} datasets...")
+        logging.info(f"Output directory: {parent_dir}")
+        
         output_yaml = {}
         filtered_datasets = []
 
@@ -1178,28 +1176,49 @@ def submit_sbatch_on_wilson(
 
 
 def establish_wilson_connection() -> paramiko.SSHClient:
-    """Establish SSH connection using key-based authentication."""
+    """Establish SSH connection with automatic key discovery or password fallback."""
     user = os.environ.get("CLUSTER_USER", os.getlogin())
     wilson_host = "wilson.diamond.ac.uk"
-    
-    ssh_key_path = os.path.expanduser("~/.ssh/id_rsa")
     
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     
+    # Try key-based authentication first (let paramiko auto-discover keys)
     try:
+        logging.info(f"Attempting SSH connection to {wilson_host} as {user}...")
         ssh.connect(
-            wilson_host, 
+            wilson_host,
             username=user,
-            key_filename=ssh_key_path,
             timeout=30,
-            banner_timeout=30
+            banner_timeout=30,
+            look_for_keys=True,  # Auto-discover SSH keys
+            allow_agent=True     # Use SSH agent if available
         )
+        logging.info("SSH connection established using key-based authentication")
         return ssh
-    except FileNotFoundError:
-        raise RuntimeError(f"SSH key not found: {ssh_key_path}")
+        
     except paramiko.AuthenticationException:
-        raise RuntimeError(f"SSH authentication failed for {user}@{wilson_host}")
+        logging.info("Key-based authentication failed, trying password authentication...")
+        
+        # Fallback to password authentication
+        try:
+            password = getpass.getpass(f"Password for {user}@{wilson_host}: ")
+            ssh.connect(
+                wilson_host,
+                username=user,
+                password=password,
+                timeout=30,
+                banner_timeout=30
+            )
+            logging.info("SSH connection established using password authentication")
+            return ssh
+            
+        except paramiko.AuthenticationException:
+            raise RuntimeError(
+                f"SSH authentication failed for {user}@{wilson_host}\n"
+                "Please check your credentials or SSH key configuration."
+            )
+    
     except paramiko.SSHException as e:
         raise RuntimeError(f"SSH connection failed: {e}")
     except Exception as e:
@@ -1532,25 +1551,53 @@ def get_buster_path(command_name: str) -> Tuple[str, str]:
 
 
 def check_buster_dependencies(verbose: bool = False) -> bool:
-    """Check if all BUSTER dependencies are available."""
+    """Check if all BUSTER dependencies are available after loading module."""
     try:
         import subprocess
         print("\nChecking BUSTER dependencies...")
+        
+        # Step 1: Try to load buster module
+        print("Loading BUSTER module...")
+        logging.info("Attempting to load buster module")
+        
+        try:
+            # Source /etc/profile and load buster module
+            load_module_cmd = "source /etc/profile 2>/dev/null && module load buster 2>&1"
+            module_result = subprocess.run(
+                load_module_cmd,
+                shell=True,
+                executable='/bin/bash',
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            if module_result.returncode == 0:
+                print("✓ BUSTER module loaded successfully")
+                logging.info("BUSTER module loaded successfully")
+            else:
+                print(f"⚠️  Warning: module load buster returned non-zero exit code")
+                logging.warning(f"module load buster stderr: {module_result.stderr}")
+                if verbose:
+                    print(f"   Output: {module_result.stderr}")
+                
+        except subprocess.TimeoutExpired:
+            print("⚠️  Warning: module load buster timed out")
+            logging.warning("module load buster timed out")
+        except Exception as e:
+            print(f"⚠️  Warning: Could not load buster module: {e}")
+            logging.warning(f"Could not load buster module: {e}")
+        
+        # Step 2: Check dependencies using buster-report
+        print("Running dependency check...")
         logging.info("Running buster-report -checkdep")
         
-        buster_report_cmd, source = get_buster_path('buster-report')
-        
-        if source == 'PATH':
-            logging.debug(f"Using buster-report from PATH: {buster_report_cmd}")
-        elif source == 'fallback':
-            logging.info(f"Using fallback buster-report: {buster_report_cmd}")
-        else:
-            print(f"⚠️  buster-report not found in expected locations, will try anyway")
-            logging.warning(f"buster-report location unknown, using: {buster_report_cmd}")
-        
-        # Run with output captured
+        # Run buster-report -checkdep in a shell with module loaded
+        checkdep_cmd = "source /etc/profile 2>/dev/null && module load buster 2>/dev/null && buster-report -checkdep"
         result = subprocess.run(
-            [buster_report_cmd, '-checkdep'],
+            checkdep_cmd,
+            shell=True,
+            executable='/bin/bash',
             capture_output=True,
             text=True,
             timeout=30
@@ -1594,8 +1641,8 @@ def check_buster_dependencies(verbose: bool = False) -> bool:
             
             print("\n" + "!"*70)
             print("! To resolve these issues:")
-            print("!   1. Run 'module load buster' before executing this script")
-            print("!   2. Ensure BUSTER environment is properly configured")
+            print("!   1. Ensure you're on a system with module environment configured")
+            print("!   2. Check that BUSTER module is available: 'module avail buster'")
             print("!   3. The cluster compute nodes will load BUSTER automatically")
             print("!"*70 + "\n")
             
@@ -1603,17 +1650,16 @@ def check_buster_dependencies(verbose: bool = False) -> bool:
             
     except FileNotFoundError:
         print("\n" + "!"*70)
-        print("! ERROR: buster-report command not found")
+        print("! ERROR: Could not run buster-report")
         print("! ")
-        print("! Tried:")
-        print("!   1. System PATH (requires 'module load buster')")
-        print(f"!   2. Fallback path: {BUSTER_REPORT_PATH_FALLBACK}")
+        print("! This could mean:")
+        print("!   1. BUSTER module failed to load")
+        print("!   2. buster-report not in PATH after module load")
+        print("!   3. Module system not available on this host")
         print("! ")
-        print("! To resolve this issue:")
-        print("!   - Run 'module load buster' before executing this script")
-        print("!   - Or update BUSTER_REPORT_PATH_FALLBACK in the script")
+        print("! Note: Cluster compute nodes will load BUSTER automatically")
         print("!"*70 + "\n")
-        logging.error("buster-report not found in PATH or at fallback location")
+        logging.error("buster-report not found after attempting module load")
         return False
     except subprocess.TimeoutExpired:
         print("\n" + "!"*70)
@@ -1796,16 +1842,26 @@ def wilson_ssh_connection():
 
 if __name__ == "__main__":
     try:
-        # Parse arguments and setup
         args = parse_args()
-        parameters_file = args.parameters
         
-        print()
-        print(f"{format_separator()}")
-        print(f"Starting Pipedream XChem pipeline with parameters: {parameters_file}")
-        print(f"{format_separator()}")
-
-        setup_logging(log_level=args.log_level, verbose=args.verbose)
+        # Read parameters first to get Output_directory
+        params = read_yaml(args.parameters)
+        validate_params(params)
+        
+        # Determine log directory from Output_directory or generate timestamp-based path
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_output_dir = f"{params['Processing_directory']}/analysis/Pipedream/Pipedream_{timestamp}"
+        log_dir = params.get('Output_directory') or default_output_dir
+        
+        # Ensure log directory exists
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # Setup logging with the determined directory
+        setup_logging(log_dir=log_dir, log_level=args.log_level, verbose=args.verbose)
+        
+        logging.info(f"Pipedream XChem Integration Script v{VERSION}")
+        logging.info(f"Log directory: {log_dir}")
+        logging.info(f"Parameters file: {args.parameters}")
         
         # Check BUSTER dependencies
         deps_ok = check_buster_dependencies(verbose=args.verbose)
@@ -1824,11 +1880,6 @@ if __name__ == "__main__":
                     print("Exiting due to dependency issues.")
                     sys.exit(1)
                 print("Continuing despite dependency issues...\n")
-        
-        # Read configuration and get datasets
-        print("Reading parameters and validating configuration...")
-        params = read_yaml(parameters_file)
-        validate_params(params)
         
         print("Getting datasets from database...")
         datasets = get_datasets(params)
