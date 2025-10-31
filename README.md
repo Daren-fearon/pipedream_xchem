@@ -109,7 +109,7 @@ Python scripts are available at:
 ### Step 1: Submit Refinement Jobs
 
 ```bash
-python pipedream_xchem.py --parameters /path/to/pipedream_parameters.yaml [OPTIONS]
+python /dls/science/groups/i04-1/software/pipedream_xchem/pipedream_xchem.py --parameters /path/to/pipedream_parameters.yaml [OPTIONS]
 ```
 
 #### Command-Line Options
