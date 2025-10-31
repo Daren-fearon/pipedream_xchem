@@ -48,6 +48,61 @@ Install missing packages using:
 ```bash
 micromamba install -c conda-forge rdkit pandas pyyaml gemmi paramiko tqdm
 ```
+---
+
+## 🔑 SSH Key Setup (Optional & first-time only)
+
+The scripts connect to `wilson.diamond.ac.uk` to submit SLURM jobs. You can set up SSH key authentication before running the pipeline or the script should default to requesting a password.
+
+### 1. Generate SSH Key Pair
+
+If you don't already have an SSH key:
+
+```bash
+ssh-keygen -t rsa -b 4096
+```
+
+- Press **Enter** to accept the default location (`~/.ssh/id_rsa`)
+- Enter a **passphrase** (minimum 5 characters - **required by Diamond IT policy**)
+- Confirm the passphrase
+
+### 2. Copy Public Key to Wilson
+
+```bash
+# Automated method (recommended)
+cat ~/.ssh/id_rsa.pub | ssh wilson.diamond.ac.uk "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+```
+
+Or manually:
+
+```bash
+# 1. Display your public key
+cat ~/.ssh/id_rsa.pub
+
+# 2. SSH to wilson and add it to authorized_keys
+ssh wilson.diamond.ac.uk
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+echo "paste_your_public_key_here" >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+exit
+```
+
+### 3. Test Your Connection
+
+```bash
+ssh wilson.diamond.ac.uk
+```
+
+✅ If successful, you should connect without entering a password (only your SSH key passphrase if you set one).
+
+### How the Script Uses SSH Keys
+
+The pipeline automatically:
+1. **Tries key-based authentication first** (looks for keys in `~/.ssh/`)
+2. **Falls back to password** if key authentication fails
+3. Uses `ssh-agent` if available to avoid repeated passphrase prompts
+
+> ⚠️ **Security Note:** Your **private key** (`~/.ssh/id_rsa`) should **never be shared**. Only the **public key** (`~/.ssh/id_rsa.pub`) is copied to remote servers.
 
 ---
 
