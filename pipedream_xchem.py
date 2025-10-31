@@ -6,7 +6,7 @@ generated from SMILES using grade2. It processes crystallographic datasets
 from an SQLite database and prepares them for automated refinement.
 
 Author: DFearon
-Date: October 2025
+Date: 31st October 2025
 """
 
 import os
@@ -22,28 +22,59 @@ import argparse
 import shutil
 import json
 from typing import Dict, List, Optional, Tuple, Any
+from pathlib import Path
+from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Constants
+# Add tqdm with graceful fallback
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+    # Fallback: tqdm does nothing if not installed
+    def tqdm(iterable, **kwargs):
+        return iterable
+
+# Configuration Constants
+VERSION = "1.0.2"
+
+
+# Exit codes documentation
+EXIT_CODES = {
+    0: "Success",
+    1: "General error or user cancelled",
+    2: "Empty OUTPUT_DIR",
+    3: "Invalid dataset line in CSV",
+    4: "Invalid CrystalName",
+    5: "Failed to generate restraints with grade2",
+    6: "No SMILES available"
+}
+
+# Cluster Configuration
 CLUSTER_BASTION = "wilson.diamond.ac.uk"
 CLUSTER_USER = os.environ.get("CLUSTER_USER", os.getlogin())
 MAX_CONCURRENT_JOBS = 100
-VERSION = "1.0.1"
+MAX_ARRAY_SIZE = 1000
+DEFAULT_SBATCH_TIMEOUT = 30
+DEFAULT_CPUS_PER_TASK = 4
+DEFAULT_MEM_PER_CPU_MB = 4096
+
+# Software Paths (fallback if module load buster fails)
+BUSTER_PIPEDREAM_PATH_FALLBACK = "/dls_sw/apps/GPhL/BUSTER/20250717/scripts/pipedream"
+BUSTER_REPORT_PATH_FALLBACK = "/dls_sw/apps/GPhL/BUSTER/20240123/scripts/buster-report"
+CSDHOME_PATH = "/dls_sw/apps/CSDS/2024.1.0/"
+MOGUL_PATH = "/dls_sw/apps/CSDS/2024.1.0/ccdc-software/mogul/bin/mogul"
+GRAPHVIZ_LIB_PATH = "/dls_sw/apps/graphviz/rhel8/12.2/lib"
 
 
-def setup_logging(log_dir: str = None, log_level: str = "INFO", verbose: bool = False) -> None:
-    """
-    Configure logging for the application.
-    
-    Args:
-        log_dir: Directory to save log files. If None, uses current directory.
-        log_level: Logging level (DEBUG, INFO, WARNING, ERROR)
-        verbose: Enable verbose console output
-    """
+def setup_logging(log_dir: str = None, log_level: str = "INFO", verbose: bool = False, log_file: str = 'pipedream.log') -> None:
+    """Configure logging with optional custom log file name."""
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(log_dir, 'pipedream.log')
+        log_path = os.path.join(log_dir, log_file)
     else:
-        log_file = 'pipedream.log'
+        log_path = log_file
     
     # Convert string level to logging constant
     numeric_level = getattr(logging, log_level.upper(), logging.INFO)
@@ -52,7 +83,7 @@ def setup_logging(log_dir: str = None, log_level: str = "INFO", verbose: bool = 
     for handler in logging.root.handlers[:]:
         logging.root.removeHandler(handler)
     
-    handlers = [logging.FileHandler(log_file)]
+    handlers = [logging.FileHandler(log_path)]
     
     # Add console handler based on verbose setting
     if verbose:
@@ -76,19 +107,21 @@ def setup_logging(log_dir: str = None, log_level: str = "INFO", verbose: bool = 
 def safe_file_copy(src: str, dst: str, crystal_name: str = "Unknown") -> bool:
     """
     Safely copy a file with proper error handling and logging.
-    
-    Args:
-        src: Source file path
-        dst: Destination file path
-        crystal_name: Crystal name for logging context
-        
-    Returns:
-        True if successful, False otherwise
     """
     try:
+        file_size = os.path.getsize(src)
+        if file_size > 100 * 1024 * 1024:  # Log for files > 100MB
+            logging.info(f"Copying large file ({file_size/1024/1024:.1f} MB): {src}")
+        
         shutil.copy2(src, dst)
         logging.debug(f"Copied {src} -> {dst} for crystal {crystal_name}")
         return True
+    except FileNotFoundError:
+        logging.error(f"Source file not found: {src} for crystal {crystal_name}")
+        return False
+    except PermissionError:
+        logging.error(f"Permission denied copying {src} for crystal {crystal_name}")
+        return False
     except Exception as e:
         logging.error(f"Failed to copy {src} -> {dst} for crystal {crystal_name}: {e}")
         return False
@@ -124,41 +157,72 @@ def extract_dataset_fields(row: pd.Series) -> Tuple[str, str, str, str, str, str
         row['CompoundSMILES']
     )
 
-def resolve_path(base_dir: str, *parts: str) -> str:
-    """Resolve a file path from base directory and path components."""
-    return os.path.realpath(os.path.join(base_dir, *parts))
-
-def get_smiles_for_compound(compound_code: str, smiles_from_db: Optional[str], input_dir: str) -> Optional[str]:
+def resolve_path(base_dir: str, *parts: str, must_exist: bool = False) -> Optional[str]:
     """
-    Get SMILES string for a compound from database and save it as a file.
+    Unified path resolution function.
+    
+    Handles both:
+    - Absolute paths (uses as-is)
+    - Relative paths (joins with base_dir)
+    - Multiple path components (joins all parts)
     
     Args:
-        compound_code (str): Compound code
-        smiles_from_db (str): SMILES from database (may be None/empty)
-        input_dir (str): Directory to save SMILES file (required)
-    
+        base_dir: Base directory for relative paths
+        *parts: Path components to join (can be relative or absolute)
+        must_exist: If True, return None if path doesn't exist
+        
     Returns:
-        str: SMILES string or None if not found
+        Absolute path or None if validation fails
+        
+    Examples:
+        resolve_path("/base", "subdir", "file.txt")
+        resolve_path("/base", "/absolute/path/file.txt")  # Returns absolute path
+        resolve_path("/base", "relative/path", must_exist=True)
     """
-    # Get SMILES from database
-    if smiles_from_db and str(smiles_from_db).strip():
-        smiles_string = str(smiles_from_db).strip()
-        logging.info(f"Using SMILES from database for {compound_code}: {smiles_string}")
-        
-        # Always save SMILES to file in input directory
-        os.makedirs(input_dir, exist_ok=True)
-        smiles_file_path = os.path.join(input_dir, f"{compound_code}.smiles")
-        try:
-            with open(smiles_file_path, 'w', encoding='utf-8') as f:
-                f.write(f"{smiles_string}\n")
-            logging.info(f"Saved SMILES to file: {smiles_file_path}")
-        except Exception as e:
-            logging.warning(f"Failed to save SMILES file for {compound_code}: {e}")
-        
-        return smiles_string
+    if not parts:
+        logging.debug("resolve_path called with no path parts")
+        return None
     
-    logging.warning(f"No SMILES found in database for {compound_code}")
-    return None
+    # Join all parts
+    path_str = os.path.join(*parts) if len(parts) > 1 else parts[0]
+    
+    # If already absolute, use as-is; otherwise join with base_dir
+    if os.path.isabs(path_str):
+        path = os.path.realpath(path_str)
+    else:
+        path = os.path.realpath(os.path.join(base_dir, path_str))
+    
+    # Validate existence if required
+    if must_exist and not os.path.exists(path):
+        logging.debug(f"Path does not exist: {path}")
+        return None
+    
+    return path
+
+def get_smiles_for_compound(
+    compound_code: str, 
+    smiles_from_db: Optional[str], 
+    input_dir: str
+) -> Optional[str]:
+    """Get SMILES string for a compound and save to file."""
+    if not validate_smiles(smiles_from_db, compound_code):
+        return None
+    
+    smiles_string = str(smiles_from_db).strip()
+    logging.debug(f"Using SMILES from database for {compound_code}: {smiles_string}")
+    
+    # Always save SMILES to file (required for downstream processing)
+    os.makedirs(input_dir, exist_ok=True)
+    smiles_file_path = os.path.join(input_dir, f"{compound_code}.smiles")
+    try:
+        with open(smiles_file_path, 'w', encoding='utf-8') as f:
+            f.write(f"{smiles_string}\n")
+        logging.debug(f"Saved SMILES to file: {smiles_file_path}")
+    except Exception as e:
+        logging.error(f"Failed to save SMILES file for {compound_code}: {e}")
+        return None  # Return None if we can't save (critical for processing)
+    
+    return smiles_string
 
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
@@ -218,6 +282,7 @@ def parse_args() -> argparse.Namespace:
         default="INFO",
         help="Set logging level (default: INFO)"
     )
+
     
     args = parser.parse_args()
     
@@ -262,8 +327,15 @@ def get_datasets(params: Dict[str, Any]) -> pd.DataFrame:
     try:
         conn = sqlite3.connect(params['Database_path'])
 
+        # Define base query components
+        base_columns = """
+            SELECT CrystalName, CompoundCode, RefinementMTZfree, 
+                   DimplePathToPDB, DimplePathToMTZ, CompoundSMILES
+            FROM mainTable
+        """
+        
+        # Build WHERE clause based on mode
         if params['Mode'] == 'specific_datasets':
-            # Only require CrystalName in the CSV
             csv_path = params.get('Dataset_csv_path') or params.get('Filtered_dataset_csv_path')
             if not csv_path:
                 raise ValueError("Missing 'Dataset_csv_path' for 'specific_datasets' mode")
@@ -273,53 +345,31 @@ def get_datasets(params: Dict[str, Any]) -> pd.DataFrame:
             crystal_names = csv_df['CrystalName'].dropna().unique().tolist()
             if not crystal_names:
                 raise ValueError("No CrystalName values found in the CSV.")
-
-            # Try to include CompoundSMILES, but don't fail if column doesn't exist
-            try:
-                query = f"""
-                    SELECT CrystalName, CompoundCode, RefinementMTZfree, 
-                           DimplePathToPDB, DimplePathToMTZ, CompoundSMILES
-                    FROM mainTable 
-                    WHERE CrystalName IN ({','.join(['?']*len(crystal_names))})
-                """
-                datasets = pd.read_sql(query, conn, params=crystal_names)
-            except Exception as e:
-                logging.warning(f"CompoundSMILES column not available in database: {e}")
-                query = f"""
-                    SELECT CrystalName, CompoundCode, RefinementMTZfree, 
-                           DimplePathToPDB, DimplePathToMTZ, NULL as CompoundSMILES
-                    FROM mainTable 
-                    WHERE CrystalName IN ({','.join(['?']*len(crystal_names))})
-                """
-                datasets = pd.read_sql(query, conn, params=crystal_names)
-            # Do not overwrite the original CSV
+            
+            where_clause = f"WHERE CrystalName IN ({','.join(['?']*len(crystal_names))})"
+            query_params = crystal_names
         else:
-            # Try to include CompoundSMILES, but don't fail if column doesn't exist
-            try:
-                query = """
-                    SELECT CrystalName, CompoundCode, RefinementMTZfree, 
-                           DimplePathToPDB, DimplePathToMTZ, CompoundSMILES
-                    FROM mainTable 
-                    WHERE RefinementOutcome = '1 - Analysis Pending'
-                """
-                datasets = pd.read_sql(query, conn)
-            except Exception as e:
-                logging.warning(f"CompoundSMILES column not available in database: {e}")
-                query = """
-                    SELECT CrystalName, CompoundCode, RefinementMTZfree, 
-                           DimplePathToPDB, DimplePathToMTZ, NULL as CompoundSMILES
-                    FROM mainTable 
-                    WHERE RefinementOutcome = '1 - Analysis Pending'
-                """
-                datasets = pd.read_sql(query, conn)
-            # Save to CSV for array job compatibility
+            where_clause = "WHERE RefinementOutcome = '1 - Analysis Pending'"
+            query_params = None
+        
+        # Try to get data with SMILES, fallback without
+        try:
+            query = base_columns + where_clause
+            datasets = pd.read_sql(query, conn, params=query_params) if query_params else pd.read_sql(query, conn)
+        except Exception as e:
+            logging.warning(f"CompoundSMILES column not available: {e}")
+            query_no_smiles = base_columns.replace(", CompoundSMILES", ", NULL as CompoundSMILES") + where_clause
+            datasets = pd.read_sql(query_no_smiles, conn, params=query_params) if query_params else pd.read_sql(query_no_smiles, conn)
+        
+        conn.close()
+        
+        # Save CSV if not in specific_datasets mode
+        if params['Mode'] != 'specific_datasets':
             csv_path = os.path.join(params['Processing_directory'], 'datasets_metadata.csv')
             datasets.to_csv(csv_path, index=False)
             params['Filtered_dataset_csv_path'] = csv_path
-
-        conn.close()
-
-        # Check for missing or empty required fields (RefinementCIF is no longer required for SMILES-based workflow)
+        
+        # Check for missing or empty required fields
         required_fields = ['CompoundCode', 'RefinementMTZfree', 'DimplePathToPDB', 'DimplePathToMTZ']
         missing_info = []
         for idx, row in datasets.iterrows():
@@ -347,12 +397,6 @@ def get_datasets(params: Dict[str, Any]) -> pd.DataFrame:
         logging.error(f"Error retrieving datasets: {e}")
         raise
 
-def fetch_password() -> str:
-    """Securely fetch password from user input."""
-    if not sys.stdin.isatty():
-        logging.error("Standard input is not a TTY. Password input may not be secure.")
-        raise RuntimeError("Insecure environment for password input.")
-    return getpass.getpass("Enter your password: ")
 
 def setup_dataset_directory(crystal_name: str, parent_dir: str) -> Tuple[str, str]:
     """Create dataset directory and input subdirectory."""
@@ -369,12 +413,20 @@ def copy_input_files_and_prepare_for_restraints(
     dimple_path_mtz: str,
     compound_code: str, 
     smiles_string: Optional[str]
-) -> Tuple[Optional[str], Optional[str]]:
+) -> bool:
     """
-    Copy required input files to the dataset input directory. 
+    Copy required input files to the dataset input directory.
     Restraint generation will happen on cluster.
+    
+    Returns:
+        True if files copied successfully and SMILES is available, False otherwise
     """
-    # Copy the main input files (MTZ, PDB, MTZ reference)
+    logging.debug(f"Copying input files for {compound_code}:")
+    logging.debug(f"RefinementMTZfree: {refinement_mtzfree_path} -> {input_dir}/")
+    logging.debug(f"DimplePathToPDB: {dimple_path_pdb} -> {input_dir}/")
+    logging.debug(f"DimplePathToMTZ: {dimple_path_mtz} -> {input_dir}/")
+    
+    # Copy the main input files
     files_to_copy = [
         (refinement_mtzfree_path, os.path.join(input_dir, os.path.basename(refinement_mtzfree_path))),
         (dimple_path_pdb, os.path.join(input_dir, os.path.basename(dimple_path_pdb))),
@@ -384,17 +436,17 @@ def copy_input_files_and_prepare_for_restraints(
     for src, dst in files_to_copy:
         if not safe_file_copy(src, dst, compound_code):
             logging.error(f"Failed to copy required file for {compound_code}: {src}")
-            return None, None
+            return False
     
-    # Return expected restraint file paths (will be generated on cluster)
+    logging.debug(f"Successfully copied all input files for {compound_code}")
+    
+    # Check if SMILES is available for restraint generation
     if smiles_string:
-        logging.info(f"SMILES available for {compound_code} - restraints will be generated on cluster")
-        expected_cif = os.path.join(input_dir, f"{compound_code}.cif")
-        expected_pdb = os.path.join(input_dir, f"{compound_code}.pdb")
-        return expected_cif, expected_pdb
+        logging.debug(f"SMILES available for {compound_code} - restraints will be generated on cluster")
+        return True
     else:
         logging.warning(f"No SMILES available for {compound_code}, cannot generate restraints")
-        return None, None
+        return False
 
 
 def process_pdb_file(input_dir: str, dimple_path_pdb: str, crystal_name: str, params: Dict[str, Any]) -> None:
@@ -417,40 +469,48 @@ def submit_jobs(
     params: Dict[str, Any], 
     output_json_path: Optional[str] = None, 
     output_csv_path: Optional[str] = None, 
-    dry_run: bool = False
+    dry_run: bool = False,
+    log_level: str = "INFO",
+    verbose: bool = False  # ← Add verbose parameter
 ) -> Tuple[str, int, str]:
-    """
-    Prepares input files and directories for each dataset. 
-    All job submission is handled via a single SLURM array job script.
-    Assigns a unique Pipedream_N output directory for each dataset at preparation time.
-    
-    Returns:
-        Tuple of (parent_dir, num_datasets, json_output_path)
-    """
+    """Prepares input files and directories for each dataset."""
     try:
-        print("Preparing input files and directories for datasets...")
-        # Use single timestamp for all operations to ensure consistency
+        print("\nPreparing input files and directories for each dataset...")
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         output_base = params.get('Output_directory') or params['Processing_directory']
         parent_dir = params.get('Output_directory') or f"{params['Processing_directory']}/analysis/Pipedream/Pipedream_{timestamp}"
         os.makedirs(parent_dir, exist_ok=True)
 
-        for handler in logging.root.handlers[:]:
-            logging.root.removeHandler(handler)
-
-        logging.basicConfig(
-            filename=f'{parent_dir}/pipedream.log',
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s'
-        )
+        # Use the verbose parameter passed from args
+        setup_logging(log_dir=parent_dir, log_level=log_level, verbose=verbose)  # ← Use verbose param
+        logging.info(f"Pipedream XChem v{VERSION} starting")
+        logging.info(f"Command: {' '.join(sys.argv)}")
 
         output_yaml = {}
         filtered_datasets = []
 
-        print(f"Processing {len(datasets)} datasets...")
-        for index, row in datasets.iterrows():
+        # Progress bar setup
+        if HAS_TQDM and not verbose:
+            # Quiet mode: show progress bar
+            print(f"Processing {len(datasets)} datasets...")
+            iterator = tqdm(
+                datasets.iterrows(), 
+                total=len(datasets),
+                desc="Processing datasets",
+                unit="dataset",
+                ncols=80,
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+            )
+        else:
+            # Verbose mode or no tqdm: show detailed output
+            print(f"Processing {len(datasets)} datasets...")
+            iterator = datasets.iterrows()
+        
+        # OPTION 1: Keep sequential (current, safe)
+        for index, row in iterator:
             crystal_name, compound_code, refinement_mtzfree, dimple_path_pdb, dimple_path_mtz, compound_smiles = extract_dataset_fields(row)
 
+            # Validate required paths
             required_paths = {
                 "RefinementMTZfree": refinement_mtzfree,
                 "DimplePathToPDB": dimple_path_pdb,
@@ -458,174 +518,115 @@ def submit_jobs(
             }
             missing_keys = [k for k, v in required_paths.items() if v is None or str(v).strip() == ""]
             if missing_keys:
-                logging.error(f"Skipping dataset {crystal_name} due to missing required file paths: {missing_keys} | Values: {required_paths}")
+                logging.error(f"Skipping {crystal_name} - missing paths: {missing_keys}")
                 continue
 
-            # Check if SMILES is available (we need it for grade2)
-            if not compound_smiles or str(compound_smiles).strip() == '' or str(compound_smiles).strip().lower() in ['none', 'null']:
-                logging.error(f"Skipping dataset {crystal_name} - no SMILES available for ligand restraint generation")
+            # Check SMILES availability
+            if not validate_smiles(compound_smiles, crystal_name):
+                logging.error(f"Skipping {crystal_name} - no valid SMILES")
                 continue
 
-            filtered_datasets.append(row)
-
-        # Prepare input files and output_yaml for filtered datasets only
-        print(f"Generating restraints and copying input files for {len(filtered_datasets)} valid datasets...")
-        successful_count = 0
-        for row in filtered_datasets:
-            crystal_name, compound_code, refinement_mtzfree, dimple_path_pdb, dimple_path_mtz, compound_smiles = extract_dataset_fields(row)
-            
-            logging.info(f"Processing dataset {crystal_name} (compound: {compound_code})")
-
-            refinement_mtzfree_path = resolve_path(params['Processing_directory'], "analysis", "model_building", crystal_name, refinement_mtzfree)
-            dimple_path_pdb = resolve_dataset_path(dimple_path_pdb, crystal_name, params['Processing_directory']) if dimple_path_pdb else None
-            dimple_path_mtz = resolve_dataset_path(dimple_path_mtz, crystal_name, params['Processing_directory']) if dimple_path_mtz else None
-
-            dataset_dir, input_dir = setup_dataset_directory(crystal_name, parent_dir)
-
-            # Get SMILES for the compound (only call once in second loop)
-            smiles_string = get_smiles_for_compound(
-                compound_code, 
-                compound_smiles,
-                input_dir
-            )
-
-            # Find next available Pipedream_N output dir for this dataset
-            # Use the same timestamp for consistency across all paths
-            output_dir = f"{dataset_dir}/Pipedream_{timestamp}"
-
+            # Process dataset
             try:
-                # Check if all required files exist before proceeding
-                file_paths = {
-                    "RefinementMTZfree": refinement_mtzfree_path,
-                    "DimplePathToPDB": dimple_path_pdb,
-                    "DimplePathToMTZ": dimple_path_mtz
-                }
-                missing_files = validate_file_paths(file_paths, crystal_name)
-                
-                if missing_files:
-                    logging.error(f"Skipping dataset {crystal_name} due to missing files: {'; '.join(missing_files)}")
-                    continue
-                
-                # Prepare input files and get expected restraint paths (generation happens on cluster)
-                generated_cif, generated_pdb = copy_input_files_and_prepare_for_restraints(
-                    input_dir, refinement_mtzfree_path, dimple_path_pdb, dimple_path_mtz, 
-                    compound_code, smiles_string
-                )
-                
-                if not (generated_cif and generated_pdb):
-                    logging.error(f"Cannot prepare restraints for {crystal_name}. Skipping.")
-                    continue
-                
-                process_pdb_file(input_dir, dimple_path_pdb, crystal_name, params)
-
-            except FileNotFoundError as e:
-                logging.error(f"Missing file for {crystal_name}: {e}")
-                logging.info(f"Skipping dataset {crystal_name} due to missing file: {e}")
-                continue
-            except TypeError as e:
-                logging.error(f"TypeError for {crystal_name}: {e}. Variables: refinement_mtzfree_path={refinement_mtzfree_path}, dimple_path_pdb={dimple_path_pdb}, dimple_path_mtz={dimple_path_mtz}")
-                logging.info(f"Skipping dataset {crystal_name} due to TypeError: {e}")
+                metadata = process_single_dataset(row, params, parent_dir, timestamp)
+                if metadata:
+                    output_yaml[crystal_name] = metadata
+                    filtered_datasets.append(row)
+                    logging.debug(f"Successfully prepared {crystal_name} ({len(filtered_datasets)} total)")
+                    
+                    # Update progress bar description with success count
+                    if HAS_TQDM and not verbose and hasattr(iterator, 'set_postfix'):
+                        iterator.set_postfix({'✓': len(filtered_datasets), '✗': index + 1 - len(filtered_datasets)})
+            except Exception as e:
+                logging.error(f"Error processing {crystal_name}: {e}")
                 continue
 
-            # --- Build correct Pipedream command for SLURM script ---
-            hklin_file = os.path.join(input_dir, os.path.basename(refinement_mtzfree_path))
-            xyzin_file = os.path.join(input_dir, os.path.basename(dimple_path_pdb))
-            hklref_file = os.path.join(input_dir, os.path.basename(dimple_path_mtz))
-            # Use the generated restraint files
-            rhofit_file = generated_cif
-            rhocommands = params['Refinement_parameters'].get('rhocommands', None)
-            pipedream_cmd = f"/dls_sw/apps/GPhL/BUSTER/20240123/scripts/pipedream -nolmr -hklin {hklin_file} -xyzin {xyzin_file} -hklref {hklref_file} -d {output_dir} "
-            refinement_args = refinement_params_to_args(params.get('Refinement_parameters', {}), rhofit_file=rhofit_file, rhocommands=rhocommands)
-            if refinement_args:
-                pipedream_cmd += refinement_args + " "
-            # Build output metadata for JSON (only fields needed by collate_pipedream_results.py)
-            output_yaml[crystal_name] = {
-                'Input_dir': input_dir,
-                'CompoundCode': compound_code,
-                'PipedreamDirectory': output_dir,
-                'ReportHTML': f"{output_dir}/report-{compound_code}/index.html",
-                'LigandReportHTML': f"{output_dir}/report-{compound_code}/ligand/index.html",
-                'ExpectedSummary': f"{output_dir}/pipedream_summary.json",
-                'PipedreamCommand': pipedream_cmd.strip(),
-                'GeneratedCIF': generated_cif,
-                'GeneratedPDB': generated_pdb,
-                'InputSMILES': smiles_string
-            }
-            successful_count += 1
-            logging.info(f"Successfully prepared dataset {crystal_name} ({successful_count} total)")
+        # Summary
+        logging.debug(f"Processing complete: {len(filtered_datasets)}/{len(datasets)} datasets prepared")
+        print(f"\n✓ Successfully prepared {len(filtered_datasets)}/{len(datasets)} datasets.")
 
-        # Log summary of processing results
-        logging.info(f"Dataset processing complete: {successful_count}/{len(filtered_datasets)} datasets successfully prepared")
-        print(f"Successfully prepared {successful_count}/{len(filtered_datasets)} datasets")
-
-        # Save output_yaml to file as JSON
-        if output_json_path:
-            json_output_path = output_json_path
-        else:
-            output_json_name = f"Pipedream_{timestamp}_output.json"
-            json_output_path = f"{parent_dir}/{output_json_name}"
-        
+        # Save JSON metadata
+        json_output_path = output_json_path or f"{parent_dir}/Pipedream_{timestamp}_output.json"
         with open(json_output_path, 'w', encoding='utf-8') as json_file:
             json.dump(output_yaml, json_file, indent=2)
-        logging.info(f"JSON metadata saved to: {json_output_path}")
+        logging.debug(f"JSON metadata saved to: {json_output_path}")
         print(f"Metadata saved to: {json_output_path}")
 
-        # Save filtered datasets to CSV for array job compatibility, including output_dir and full command
-        # Only include datasets that were successfully processed (exist in output_yaml)
-        successfully_processed_datasets = [row for row in filtered_datasets if row['CrystalName'] in output_yaml]
-        
-        if not successfully_processed_datasets:
-            logging.warning("No datasets were successfully processed. No CSV will be created.")
+        # Handle empty results
+        if not filtered_datasets:
+            logging.warning("No datasets successfully processed.")
             if dry_run:
-                logging.info("DRY RUN: No datasets processed successfully.")
-                print("DRY RUN: No datasets processed successfully.")
+                print("Dry run: No datasets processed successfully.")
                 return parent_dir, 0, json_output_path
             else:
                 raise ValueError("No datasets were successfully processed.")
         
-        filtered_df = pd.DataFrame(successfully_processed_datasets)
-        # Extract output directories for successfully processed datasets only
-        successful_output_dirs = [output_yaml[row['CrystalName']]['PipedreamDirectory'] for row in successfully_processed_datasets]
-        filtered_df['PipedreamDirectory'] = successful_output_dirs
-        # Add the full command for each dataset
-        filtered_df['PipedreamCommand'] = [output_yaml[row['CrystalName']]['PipedreamCommand'] for row in successfully_processed_datasets]
-        # Only keep the required columns for the SLURM script
-        required_cols = ['CrystalName', 'CompoundCode', 'RefinementMTZfree', 'DimplePathToPDB', 'DimplePathToMTZ', 'CompoundSMILES', 'PipedreamDirectory', 'PipedreamCommand']
+        # Save CSV with metadata
+        filtered_df = pd.DataFrame(filtered_datasets)
+        filtered_df['PipedreamDirectory'] = [output_yaml[row['CrystalName']]['PipedreamDirectory'] for row in filtered_datasets]
+        filtered_df['PipedreamCommand'] = [output_yaml[row['CrystalName']]['PipedreamCommand'] for row in filtered_datasets]
+        
+        required_cols = ['CrystalName', 'CompoundCode', 'RefinementMTZfree', 'DimplePathToPDB', 
+                        'DimplePathToMTZ', 'CompoundSMILES', 'PipedreamDirectory', 'PipedreamCommand']
         filtered_df = filtered_df[required_cols]
         
-        if output_csv_path:
-            filtered_csv_path = output_csv_path
-        else:
-            filtered_csv_path = os.path.join(parent_dir, 'datasets_metadata.csv')
-        
+        filtered_csv_path = output_csv_path or os.path.join(parent_dir, 'datasets_metadata.csv')
         filtered_df.to_csv(filtered_csv_path, index=False)
         params['Filtered_dataset_csv_path'] = filtered_csv_path
-        logging.info(f"CSV datasets saved to: {filtered_csv_path}")
-
-        # Print the number of valid datasets for SLURM
-        logging.info(f"Number of valid datasets for SLURM: {filtered_df.shape[0]}")
-        print(f"Prepared {filtered_df.shape[0]} datasets for processing.")
+        logging.debug(f"CSV datasets saved to: {filtered_csv_path}")
         
         if dry_run:
-            logging.info("DRY RUN: Files prepared but no SLURM job will be submitted.")
-            print("DRY RUN: Files prepared but no SLURM job will be submitted.")
-            return parent_dir, filtered_df.shape[0], json_output_path
+            logging.debug("Dry run: Files prepared but no SLURM jobs will be submitted.")
+            print("Dry run: Files prepared but no SLURM jobs will be submitted.")
+            return parent_dir, len(filtered_df), json_output_path
 
-        # Write SLURM array index to CrystalName mapping for debugging in array_logs dir
+        # Create SLURM array index mapping
         array_logs_dir = os.path.join(parent_dir, 'array_logs')
         os.makedirs(array_logs_dir, exist_ok=True)
-        # Use the same timestamp for consistency across all paths
         slurm_map_path = os.path.join(array_logs_dir, f'slurm_array_index_map_{timestamp}.csv')
         with open(slurm_map_path, 'w', encoding='utf-8') as f:
             f.write('SLURM_ARRAY_TASK_ID,CrystalName\n')
-            for idx, row in enumerate(successfully_processed_datasets):
+            for idx, row in enumerate(filtered_datasets):
                 f.write(f'{idx},{row["CrystalName"]}\n')
 
-        return parent_dir, filtered_df.shape[0], json_output_path
+        return parent_dir, len(filtered_df), json_output_path
 
     except Exception as e:
         logging.error(f"Error preparing input files: {e}")
         raise
+
+def validate_smiles(smiles: Optional[str], compound_code: str = "Unknown") -> bool:
+    """
+    Validate SMILES string (consolidated validation logic).
+    
+    Args:
+        smiles: SMILES string to validate
+        compound_code: Compound code for logging context (optional)
+        
+    Returns:
+        True if valid SMILES string, False otherwise
+        
+    Examples:
+        >>> validate_smiles("CCO")
+        True
+        >>> validate_smiles(None)
+        False
+        >>> validate_smiles("none")
+        False
+    """
+    if not smiles or str(smiles).strip().lower() in ['none', 'null', 'nan', '']:
+        return False
+    
+    smiles_str = str(smiles).strip().lower()
+    
+    # Check for null placeholders
+    invalid_values = ['none', 'null', 'nan', '']
+    is_valid = smiles_str not in invalid_values
+    
+    if not is_valid and compound_code != "Unknown":
+        logging.debug(f"Invalid SMILES placeholder for {compound_code}: {smiles_str}")
+    
+    return is_valid
 
 def refinement_params_to_args(
     refinement_params: Dict[str, Any], 
@@ -633,20 +634,21 @@ def refinement_params_to_args(
     rhocommands: Optional[Any] = None
 ) -> str:
     """
-    Convert the Refinement_parameters dict from YAML to a string of Pipedream command-line arguments.
-    Handles booleans, strings, and lists (e.g. rhocommands).
-    If rhofit_file and rhocommands are provided, include them as well.
-    Automatically prepends a dash to each rhocommand if not present, and ensures correct command line for -rhocommands.
-    Handles both single and multiple rhocommands robustly.
-    Special handling: TLS and WaterUpdatePkmaps values are combined into a single -mrefine flag.
+    Convert Refinement_parameters dict to Pipedream command-line arguments.
+    
+    Special handling:
+    - TLS and WaterUpdatePkmaps are combined into single -mrefine flag
+    - rhocommands are properly formatted with dashes
+    
+    Returns:
+        Space-separated command line arguments
     """
     args = []
     
-    # Build -mrefine flag with TLS and optionally WaterUpdatePkmaps
+    # Build -mrefine flag (combines TLS and WaterUpdatePkmaps)
     tls_value = refinement_params.get('TLS', '')
     water_update_pkmaps = refinement_params.get('WaterUpdatePkmaps', False)
     
-    # Handle -mrefine flag specially (combines TLS and WaterUpdatePkmaps)
     if tls_value or water_update_pkmaps:
         mrefine_parts = []
         if tls_value:
@@ -656,39 +658,247 @@ def refinement_params_to_args(
         if mrefine_parts:
             args.append(f"-mrefine {','.join(mrefine_parts)}")
     
+    # Process other parameters (skip special cases)
+    skip_keys = {'rhocommands', 'WaterUpdatePkmaps', 'TLS'}
+    
     for key, value in refinement_params.items():
-        if key in ['rhocommands', 'WaterUpdatePkmaps', 'TLS']:
-            continue  # handled separately
+        if key in skip_keys:
+            continue
+            
         if isinstance(value, bool):
             if value:
                 args.append(f"-{key}")
-        elif isinstance(value, str):
-            if value.strip():
-                args.append(f"-{key} {value}")
+        elif isinstance(value, str) and value.strip():
+            args.append(f"-{key} {value}")
         elif isinstance(value, list):
-            # For lists (other than rhocommands), join as space-separated
             joined = ' '.join(str(v) for v in value if str(v).strip())
             if joined:
                 args.append(f"-{key} {joined}")
+    
+    # Add rhofit file
     if rhofit_file:
         args.append(f"-rhofit {rhofit_file}")
+    
+    # Add rhocommands with proper formatting
     if rhocommands:
-        # Accept both list and string
         def ensure_dash(cmd):
             cmd = str(cmd).strip()
             return cmd if cmd.startswith('-') else f'-{cmd}' if cmd else ''
+        
         if isinstance(rhocommands, list):
             rhocmds = [ensure_dash(cmd) for cmd in rhocommands if str(cmd).strip()]
             rhocmd_str = ' '.join(rhocmds)
         else:
             rhocmd_str = ensure_dash(rhocommands)
+        
         if rhocmd_str:
-            # Remove any leading/trailing quotes to avoid double quoting
+            # Clean up formatting
             rhocmd_str = rhocmd_str.strip('"\'')
-            # Collapse multiple spaces
             rhocmd_str = ' '.join(rhocmd_str.split())
             args.append(f'-rhocommands {rhocmd_str}')
+    
     return " ".join(args)
+
+def generate_slurm_header(num_datasets: int, array_offset: int = 0) -> str:
+    """
+    Generate SLURM job script header with directives.
+    
+    Args:
+        num_datasets: Number of datasets to process
+        array_offset: Offset for chunked arrays (default 0)
+        
+    Returns:
+        String with SLURM header directives
+    """
+    array_max = num_datasets - 1
+    max_concurrent = min(MAX_CONCURRENT_JOBS, num_datasets)
+    
+    return f"""#!/bin/bash
+#SBATCH --job-name=pipedream_array
+#SBATCH --partition=cs05r
+#SBATCH --cpus-per-task=4
+#SBATCH --mem-per-cpu=4096
+#SBATCH --array=0-{array_max}%{max_concurrent}
+#SBATCH --output=array_logs/pipedream_array_%A_%a.out
+
+# Exit codes: {', '.join(f'{k}={v}' for k, v in EXIT_CODES.items())}
+"""
+
+
+def generate_environment_setup() -> str:
+    """
+    Generate environment setup section for SLURM script.
+    
+    Returns:
+        String with module loads and environment variables
+    """
+    return f"""
+mkdir -p array_logs
+source /etc/profile 2>/dev/null
+module load buster >/dev/null 2>&1
+module load graphviz >/dev/null 2>&1
+export LD_LIBRARY_PATH={GRAPHVIZ_LIB_PATH}:$LD_LIBRARY_PATH
+export CSDHOME={CSDHOME_PATH}
+export BDG_TOOL_MOGUL={MOGUL_PATH}
+"""
+
+
+def generate_csv_parsing_section(datasets_csv: str, processing_dir: str, array_offset: int) -> str:
+    """
+    Generate CSV parsing and validation section.
+    
+    Args:
+        datasets_csv: Path to CSV file with dataset metadata
+        processing_dir: Base processing directory
+        array_offset: Offset for chunked arrays
+        
+    Returns:
+        String with bash code for CSV parsing
+    """
+    csv_line_offset = array_offset + 2  # +2 for header and 0-based indexing
+    
+    return f"""
+DATASETS_CSV="{datasets_csv}"
+PROCESSING_DIR="{processing_dir}"
+TASK_ID=$SLURM_ARRAY_TASK_ID
+
+# Calculate CSV line number
+CSV_LINE_NUM=$(($TASK_ID + {csv_line_offset}))
+DATASET_LINE=$(awk -v n=$CSV_LINE_NUM 'NR==n' "$DATASETS_CSV")
+
+# Validate dataset line
+if [ -z "$DATASET_LINE" ] || [[ "$DATASET_LINE" =~ ^[0-9]+$ ]]; then
+  echo "[ERROR] No valid dataset at CSV line $CSV_LINE_NUM (array task $TASK_ID, offset {array_offset})"
+  exit 3
+fi
+
+# Parse CSV line
+IFS=',' read -r CrystalName CompoundCode RefinementMTZfree DimplePathToPDB DimplePathToMTZ CompoundSMILES PipedreamDirectory PipedreamCommand <<< "$DATASET_LINE"
+
+# Validate crystal name
+if [ -z "$CrystalName" ] || [[ "$CrystalName" =~ ^[0-9]+$ ]]; then
+  echo "[ERROR] Invalid CrystalName at CSV line $CSV_LINE_NUM"
+  exit 4
+fi
+
+echo "[SLURM] Processing: $CrystalName (array task $TASK_ID, CSV line $CSV_LINE_NUM)"
+"""
+
+
+def generate_directory_setup_section(output_dir: str) -> str:
+    """
+    Generate directory setup and logging redirection.
+    
+    Args:
+        output_dir: Base output directory
+        
+    Returns:
+        String with bash code for directory setup
+    """
+    return f"""
+# Setup directories
+OUTPUT_DIR_BASE="{output_dir}"
+DATASET_DIR="$OUTPUT_DIR_BASE/$CrystalName"
+INPUT_DIR="$DATASET_DIR/input_files"
+OUTPUT_DIR="$PipedreamDirectory"
+
+mkdir -p "$DATASET_DIR"
+LOG_BASENAME="${{CrystalName}}_slurm_$(basename $OUTPUT_DIR).out"
+exec > "$DATASET_DIR/$LOG_BASENAME" 2>&1
+
+# Validate output directory
+if [ -z "$OUTPUT_DIR" ]; then
+  echo "[ERROR] OUTPUT_DIR is empty for $CrystalName"
+  exit 2
+fi
+
+mkdir -p "$INPUT_DIR"
+
+# Clean existing output
+if [ -d "$OUTPUT_DIR" ]; then
+  echo "[INFO] Removing existing output directory..."
+  rm -rf "$OUTPUT_DIR"
+fi
+"""
+
+
+def generate_file_copy_section(processing_dir: str) -> str:
+    """
+    Generate file copying section.
+    
+    Args:
+        processing_dir: Base processing directory
+        
+    Returns:
+        String with bash code for copying input files
+    """
+    return f"""
+# Copy input files
+cp "$PROCESSING_DIR/analysis/model_building/$CrystalName/$RefinementMTZfree" "$INPUT_DIR/"
+cp "$DimplePathToPDB" "$INPUT_DIR/"
+cp "$DimplePathToMTZ" "$INPUT_DIR/"
+"""
+
+
+def generate_restraint_generation_section() -> str:
+    """
+    Generate ligand restraint generation section using grade2.
+    
+    Note: SMILES validation happens in Python before job submission.
+    This script assumes valid SMILES is available.
+    
+    Returns:
+        String with bash code for grade2 restraint generation
+    """
+    return """
+# Generate ligand restraints using SMILES
+# Note: SMILES validation already performed before job submission
+echo "Generating ligand restraints for $CompoundCode using grade2..."
+echo "Using SMILES: $CompoundSMILES"
+
+TEMP_SMILES="$INPUT_DIR/${CompoundCode}_temp.smi"
+echo "$CompoundSMILES" > "$TEMP_SMILES"
+
+cd "$INPUT_DIR"
+echo "Running: grade2 -i $TEMP_SMILES -r LIG -o $CompoundCode -f"
+grade2 -i "$TEMP_SMILES" -r LIG -o "$CompoundCode" -f
+GRADE2_EXIT=$?
+
+rm -f "$TEMP_SMILES"
+
+# Validate grade2 output
+if [ $GRADE2_EXIT -eq 0 ] && [ -f "${CompoundCode}.restraints.cif" ] && [ -f "${CompoundCode}.xyz.pdb" ]; then
+  echo "Successfully generated restraints for $CompoundCode"
+  mv "${CompoundCode}.restraints.cif" "${CompoundCode}.cif"
+  mv "${CompoundCode}.xyz.pdb" "${CompoundCode}.pdb"
+  echo "Renamed files to: ${CompoundCode}.cif, ${CompoundCode}.pdb"
+else
+  echo "[ERROR] Failed to generate restraints for $CompoundCode. grade2 exit code: $GRADE2_EXIT"
+  ls -la "$INPUT_DIR" | grep "$CompoundCode"
+  exit 5
+fi
+"""
+
+
+def generate_pipedream_execution_section() -> str:
+    """
+    Generate Pipedream execution and cleanup section.
+    
+    Returns:
+        String with bash code for running Pipedream
+    """
+    return """
+# Run Pipedream
+CMD=$(echo "$PipedreamCommand" | sed 's/^"//;s/"$//' | tr -s ' ')
+echo "Running command: $CMD"
+bash -c "$CMD"
+
+# Cleanup setvar files
+if compgen -G "__*.setvar.lis" > /dev/null; then
+  mv __*.setvar.lis array_logs/ 2>/dev/null
+fi
+"""
+
 
 def write_array_job_script(
     datasets_csv: str, 
@@ -696,192 +906,69 @@ def write_array_job_script(
     num_datasets: int, 
     script_path: str, 
     processing_dir: str, 
-    refinement_params: Optional[Dict[str, Any]] = None
+    refinement_params: Optional[Dict[str, Any]] = None,
+    array_offset: int = 0
 ) -> None:
-    """Write SLURM array job script for batch processing."""
-    # Only write array line if there is at least one dataset
+    """
+    Write SLURM array job script for batch processing.
+    
+    Args:
+        datasets_csv: Path to CSV file with dataset metadata
+        output_dir: Base output directory
+        num_datasets: Number of datasets in this chunk
+        script_path: Where to write the script
+        processing_dir: Base processing directory
+        refinement_params: Refinement parameters dict (currently unused)
+        array_offset: Offset for chunked job arrays (default 0)
+        
+    Raises:
+        ValueError: If num_datasets exceeds MAX_ARRAY_SIZE or is < 1
+        ValueError: If datasets_csv doesn't exist
+    """
+    # Validation
     if num_datasets < 1:
         raise ValueError("No datasets to process: cannot write SLURM array job script.")
     
-    # Add validation to ensure all required paths exist
+    if num_datasets > MAX_ARRAY_SIZE:
+        raise ValueError(
+            f"num_datasets ({num_datasets}) exceeds MAX_ARRAY_SIZE ({MAX_ARRAY_SIZE}). "
+            "Use chunking in main()."
+        )
+    
     if not datasets_csv or not os.path.exists(datasets_csv):
         raise ValueError(f"Datasets CSV file does not exist: {datasets_csv}")
     
-    # Ensure the parent directory of script_path exists
+    # Ensure script directory exists
     script_dir = os.path.dirname(script_path)
     if not os.path.exists(script_dir):
-        logging.warning(f"Script directory does not exist, creating: {script_dir}")
+        logging.info(f"Creating script directory: {script_dir}")
         os.makedirs(script_dir, exist_ok=True)
     
-    # Log the parameters being used
-    logging.info(f"Writing SLURM script with parameters:")
-    logging.info(f"  datasets_csv: {datasets_csv}")
-    logging.info(f"  output_dir: {output_dir}")
-    logging.info(f"  num_datasets: {num_datasets}")
-    logging.info(f"  script_path: {script_path}")
-    logging.info(f"  processing_dir: {processing_dir}")
+    # Log configuration
+    logging.info(f"Writing SLURM script: {script_path}")
+    logging.info(f"  Array range: 0-{num_datasets-1} (offset: {array_offset})")
+    logging.info(f"  CSV line offset: {array_offset + 2}")
+    logging.info(f"  Max concurrent: {min(MAX_CONCURRENT_JOBS, num_datasets)}")
     
-    # Cap at maximum concurrent jobs
-    script_content = """#!/bin/bash
-#SBATCH --job-name=pipedream_array
-#SBATCH --partition=cs05r
-#SBATCH --cpus-per-task=4
-#SBATCH --mem-per-cpu=4096
-#SBATCH --array=0-{num_datasets}%{max_jobs}
-#SBATCH --output=array_logs/pipedream_array_%A_%a.out
-
-# Create array_logs directory for SLURM output
-mkdir -p array_logs
-
-# Load modules (silence module system errors)
-source /etc/profile 2>/dev/null
-module load buster >/dev/null 2>&1
-module load graphviz >/dev/null 2>&1
-export LD_LIBRARY_PATH=/dls_sw/apps/graphviz/rhel8/12.2/lib:$LD_LIBRARY_PATH
-
-# Set up CSD environment for grade2
-export CSDHOME=/dls_sw/apps/CSDS/2024.1.0/
-export BDG_TOOL_MOGUL=/dls_sw/apps/CSDS/2024.1.0/ccdc-software/mogul/bin/mogul
-
-# Path to your datasets CSV
-DATASETS_CSV="{datasets_csv}"
-# Path to processing directory for input files
-PROCESSING_DIR="{processing_dir}"
-
-# Get the dataset info for this array task
-TASK_ID=$SLURM_ARRAY_TASK_ID
-# Extract the dataset row (skip header)
-DATASET_LINE=$(awk -v n=$((TASK_ID+2)) 'NR==n' "$DATASETS_CSV")
-
-# Check for empty or invalid dataset line
-if [ -z "$DATASET_LINE" ] || [[ "$DATASET_LINE" =~ ^[0-9]+$ ]]; then
-  echo "[ERROR] No valid dataset line found for SLURM_ARRAY_TASK_ID $TASK_ID. Exiting."
-  exit 3
-fi
-
-# Parse CSV columns (adjust if your CSV has different columns/order)
-IFS=',' read -r CrystalName CompoundCode RefinementMTZfree DimplePathToPDB DimplePathToMTZ CompoundSMILES PipedreamDirectory PipedreamCommand <<< "$DATASET_LINE"
-
-# Check for invalid or missing CrystalName
-if [ -z "$CrystalName" ] || [[ "$CrystalName" =~ ^[0-9]+$ ]]; then
-  echo "[ERROR] Invalid or missing CrystalName for SLURM_ARRAY_TASK_ID $TASK_ID. Exiting."
-  exit 4
-fi
-
-# Print CrystalName at the top of the log for easier debugging
-echo "[SLURM] CrystalName: $CrystalName (SLURM_ARRAY_TASK_ID: $TASK_ID)"
-
-# Set up input/output directories as in your Python logic
-OUTPUT_DIR_BASE="{output_dir}"
-DATASET_DIR="$OUTPUT_DIR_BASE/$CrystalName"
-INPUT_DIR="$DATASET_DIR/input_files"
-OUTPUT_DIR="$PipedreamDirectory"
-
-# Redirect all output to a unique per-dataset log file in the dataset directory (using output dir name)
-mkdir -p "$DATASET_DIR"
-LOG_BASENAME="${{CrystalName}}_slurm_$(basename $OUTPUT_DIR).out"
-exec > "$DATASET_DIR/$LOG_BASENAME" 2>&1
-
-# Check for empty output dir
-if [ -z "$OUTPUT_DIR" ]; then
-  echo "[ERROR] OUTPUT_DIR is empty for $CrystalName. Check your datasets.csv and Python logic."
-  exit 2
-fi
-
-# Only create input dir, not output dir
-mkdir -p "$INPUT_DIR"
-
-# If output dir exists, remove it to allow reprocessing
-if [ -d "$OUTPUT_DIR" ]; then
-  echo "[INFO] Output directory $OUTPUT_DIR already exists for $CrystalName. Removing for reprocessing..."
-  rm -rf "$OUTPUT_DIR"
-fi
-
-# Copy input files from processing directory (not output directory)
-cp "$PROCESSING_DIR/analysis/model_building/$CrystalName/$RefinementMTZfree" "$INPUT_DIR/"
-cp "$DimplePathToPDB" "$INPUT_DIR/"
-cp "$DimplePathToMTZ" "$INPUT_DIR/"
-
-# Generate ligand restraints using grade2 if SMILES is available
-if [ -n "$CompoundSMILES" ] && [ "$CompoundSMILES" != "None" ] && [ "$CompoundSMILES" != "NULL" ]; then
-  echo "Generating ligand restraints for $CompoundCode using grade2..."
-  echo "Using SMILES: $CompoundSMILES"
-  
-  # Check CSD availability for grade2
-  echo "Checking CSD environment for grade2..."
-  echo "BDG_TOOL_MOGUL: $BDG_TOOL_MOGUL"
-  echo "BDG_TOOL_CSD_PYTHON_API: $BDG_TOOL_CSD_PYTHON_API"
-  
-  # Create SMILES file from database data
-  SMILES_FILE="$INPUT_DIR/$CompoundCode.smiles"
-  echo "$CompoundSMILES" > "$SMILES_FILE"
-  
-  # Create temporary SMILES file for grade2
-  TEMP_SMILES="$INPUT_DIR/${{CompoundCode}}_temp.smi"
-  echo "$CompoundSMILES" > "$TEMP_SMILES"
-  
-  # Run grade2 to generate restraints
-  cd "$INPUT_DIR"
-  echo "Running: grade2 -i $TEMP_SMILES -r LIG -o $CompoundCode -f"
-  grade2 -i "$TEMP_SMILES" -r LIG -o "$CompoundCode" -f
-  GRADE2_EXIT=$?
-  
-  # Clean up temporary file
-  rm -f "$TEMP_SMILES"
-  
-  # Check if grade2 succeeded and rename files to expected names
-  if [ $GRADE2_EXIT -eq 0 ] && [ -f "${{CompoundCode}}.restraints.cif" ] && [ -f "${{CompoundCode}}.xyz.pdb" ]; then
-    echo "Successfully generated restraints for $CompoundCode"
-    echo "Generated files: ${{CompoundCode}}.restraints.cif, ${{CompoundCode}}.xyz.pdb"
+    # Build script by concatenating sections
+    script_sections = [
+        generate_slurm_header(num_datasets, array_offset),
+        generate_environment_setup(),
+        generate_csv_parsing_section(datasets_csv, processing_dir, array_offset),
+        generate_directory_setup_section(output_dir),
+        generate_file_copy_section(processing_dir),
+        generate_restraint_generation_section(),
+        generate_pipedream_execution_section()
+    ]
+    script_content = '\n'.join(script_sections)
     
-    # Rename files to match expected names for Pipedream
-    mv "${{CompoundCode}}.restraints.cif" "${{CompoundCode}}.cif"
-    mv "${{CompoundCode}}.xyz.pdb" "${{CompoundCode}}.pdb"
-    
-    echo "Renamed files to: ${{CompoundCode}}.cif, ${{CompoundCode}}.pdb"
-  else
-    echo "[ERROR] Failed to generate restraints for $CompoundCode. grade2 exit code: $GRADE2_EXIT"
-    echo "Expected files from grade2: ${{CompoundCode}}.restraints.cif, ${{CompoundCode}}.xyz.pdb"
-    echo "Note: If CSD is not available, consider using the Grade Webserver at http://grade.globalphasing.org"
-    ls -la "$INPUT_DIR" | grep "$CompoundCode"
-    exit 5
-  fi
-else
-  echo "[ERROR] No SMILES available for $CompoundCode. CompoundSMILES value: '$CompoundSMILES'"
-  exit 6
-fi
-
-# Use the full command from the CSV
-# Remove any surrounding quotes that might have been added during CSV parsing
-CMD=$(echo "$PipedreamCommand" | sed 's/^"//;s/"$//')
-
-# Collapse multiple spaces to a single space
-CMD=$(echo "$CMD" | tr -s ' ')
-
-# Run Pipedream (this will create the output dir)
-echo "Running command: $CMD"
-eval $CMD
-
-# Move any __*.setvar.lis files to array_logs dir for tidiness
-if compgen -G "__*.setvar.lis" > /dev/null; then
-  mv __*.setvar.lis array_logs/
-fi
-""".format(
-        num_datasets=num_datasets-1,
-        max_jobs=MAX_CONCURRENT_JOBS,
-        datasets_csv=datasets_csv,
-        processing_dir=processing_dir,
-        output_dir=output_dir
-    )
-    
-    # Write the script to file with explicit error handling
+    # Write script with atomic operation
     try:
-        # First, write to a temporary file
         temp_script_path = script_path + '.tmp'
         with open(temp_script_path, "w", encoding='utf-8') as f:
             f.write(script_content)
         
-        # Verify temp file was written correctly
+        # Validate temporary file
         if not os.path.exists(temp_script_path):
             raise IOError(f"Failed to create temporary script file: {temp_script_path}")
         
@@ -889,160 +976,928 @@ fi
         if temp_size == 0:
             raise ValueError(f"Temporary script file is empty: {temp_script_path}")
         
-        # Move temp file to final location
+        # Atomic move
         shutil.move(temp_script_path, script_path)
         
-        logging.info(f"SLURM script written to: {script_path} ({temp_size} bytes)")
-        
-        # Final verification
-        if not os.path.exists(script_path):
-            raise IOError(f"Script file does not exist after writing: {script_path}")
-        
+        # Final validation
         final_size = os.path.getsize(script_path)
-        if final_size == 0:
-            raise ValueError(f"Final script file is empty: {script_path}")
+        logging.info(f"SLURM script written successfully: {script_path} ({final_size} bytes)")
         
-        logging.info(f"SLURM script verification: file contains {final_size} bytes")
-            
     except Exception as e:
         logging.error(f"Error writing SLURM script to {script_path}: {e}")
-        # Clean up temp file if it exists
         if os.path.exists(temp_script_path):
             try:
                 os.remove(temp_script_path)
             except:
                 pass
         raise
-def submit_sbatch_on_wilson(script_path: str, processing_dir: str) -> None:
+
+def ensure_remote_directory(sftp: paramiko.SFTPClient, remote_dir: str) -> None:
     """
-    SSH to wilson and submit the job script using sbatch, using password authentication.
-    Uses $CLUSTER_USER if set, otherwise current user.
-    Uses paramiko for SSH and SFTP.
+    Ensure remote directory exists, creating it if necessary.
+    
+    Args:
+        sftp: Active SFTP client
+        remote_dir: Remote directory path to create/verify
+        
+    Raises:
+        IOError: If directory cannot be created
     """
-    user = os.environ.get("CLUSTER_USER", os.getlogin())
-    wilson_host = "wilson.diamond.ac.uk"
+    try:
+        sftp.chdir(remote_dir)
+        logging.debug(f"Remote directory exists: {remote_dir}")
+    except IOError:
+        # Directory does not exist, create it recursively
+        logging.info(f"Creating remote directory: {remote_dir}")
+        parts = remote_dir.strip('/').split('/')
+        path = ''
+        for part in parts:
+            path += '/' + part
+            try:
+                sftp.chdir(path)
+            except IOError:
+                sftp.mkdir(path)
+                sftp.chdir(path)
+        logging.info(f"Successfully created remote directory: {remote_dir}")
+
+
+def copy_file_to_remote(
+    sftp: paramiko.SFTPClient, 
+    local_path: str, 
+    remote_path: str
+) -> None:
+    """
+    Copy a local file to remote location via SFTP.
+    
+    Args:
+        sftp: Active SFTP client
+        local_path: Local file path to copy
+        remote_path: Remote destination path
+        
+    Raises:
+        IOError: If file copy fails
+    """
+    remote_name = os.path.basename(remote_path)
+    print(f"\nCopying {remote_name} to wilson...")
+    
+    try:
+        sftp.put(local_path, remote_path)
+        logging.info(f"File copied to wilson:{remote_path}")
+    except Exception as e:
+        logging.error(f"Failed to copy file to wilson: {e}")
+        raise
+
+
+def execute_sbatch_command(
+    ssh_client: paramiko.SSHClient, 
+    script_name: str, 
+    working_dir: str
+) -> Tuple[int, str, str]:
+    """
+    Execute sbatch command on remote host and return results.
+    
+    Args:
+        ssh_client: Active SSH client
+        script_name: Name of the script to submit
+        working_dir: Working directory for sbatch execution
+        
+    Returns:
+        Tuple of (exit_status, stdout, stderr)
+    """
+    command = f"cd {working_dir} && sbatch {script_name}"
+    logging.debug(f"Executing remote command: {command}")
+    
+    print(f"Submitting job...")
+    stdin, stdout, stderr = ssh_client.exec_command(command)
+    
+    # Wait for command to complete and get results
+    exit_status = stdout.channel.recv_exit_status()
+    out = stdout.read().decode().strip()
+    err = stderr.read().decode().strip()
+    
+    logging.info(f"sbatch exit status: {exit_status}")
+    if out:
+        logging.info(f"sbatch stdout: {out}")
+    if err:
+        # Filter out harmless module errors
+        harmless_error = "Module ERROR: no such variable"
+        if harmless_error in err:
+            logging.debug(f"sbatch harmless stderr (suppressed): {err}")
+        else:
+            logging.warning(f"sbatch stderr: {err}")
+    
+    return exit_status, out, err
+
+
+def validate_sbatch_result(exit_status: int, stdout: str, stderr: str) -> None:
+    """
+    Validate sbatch execution results and raise errors if needed.
+    
+    Args:
+        exit_status: Exit code from sbatch
+        stdout: Standard output from sbatch
+        stderr: Standard error from sbatch
+        
+    Raises:
+        RuntimeError: If sbatch command failed
+    """
+    if exit_status != 0:
+        logging.error(f"sbatch failed with exit status {exit_status}")
+        if stderr:
+            logging.error(f"sbatch error output: {stderr}")
+        print(f"ERROR: sbatch failed with exit status {exit_status}")
+        if stderr:
+            print(f"Error output: {stderr}")
+        raise RuntimeError(f"sbatch command failed with exit status {exit_status}")
+    
+    if not stdout:
+        logging.error("sbatch produced no output")
+        print("ERROR: sbatch produced no output")
+        raise RuntimeError("sbatch command produced no output")
+    
+    # Success!
+    print(f"✓ Job submitted successfully!")
+    print(f"{stdout}")
+
+
+def submit_sbatch_on_wilson(
+    script_path: str, 
+    processing_dir: str, 
+    ssh_client: paramiko.SSHClient
+) -> None:
+    """
+    Copy script to wilson and submit via sbatch.
+    
+    This orchestrates the complete submission workflow:
+    1. Open SFTP connection
+    2. Ensure remote directory exists
+    3. Copy script file to remote
+    4. Execute sbatch command
+    5. Validate and report results
+    
+    Args:
+        script_path: Local path to the job script
+        processing_dir: Remote directory to copy script to
+        ssh_client: Existing paramiko SSH client connection
+        
+    Raises:
+        RuntimeError: If submission fails
+        IOError: If file operations fail
+    """
     remote_script_name = os.path.basename(script_path)
     remote_script_path = os.path.join(processing_dir, remote_script_name)
-    print(f"Connecting to {wilson_host} as {user}...")
-    password = getpass.getpass(f"Enter password for {user}@wilson: ")
-    logging.info(f"[INFO] Connecting to wilson and copying job script...")
+    
     try:
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(wilson_host, username=user, password=password)
-        sftp = ssh.open_sftp()
-        # Ensure remote directory exists
+        # Step 1: Open SFTP connection
+        sftp = ssh_client.open_sftp()
+        
         try:
-            sftp.chdir(processing_dir)
-        except IOError:
-            # Directory does not exist, try to create it
-            parts = processing_dir.strip('/').split('/')
-            path = ''
-            for part in parts:
-                path += '/' + part
-                try:
-                    sftp.chdir(path)
-                except IOError:
-                    sftp.mkdir(path)
-                    sftp.chdir(path)
-        # Copy the script
-        sftp.put(script_path, remote_script_path)
-        sftp.close()
-        logging.info(f"[INFO] Script copied to wilson:{remote_script_path}")
-        print(f"Job script copied to wilson. Submitting job...")
-        # Submit the job
-        stdin, stdout, stderr = ssh.exec_command(f"cd {processing_dir} && sbatch {remote_script_name}")
-        out = stdout.read().decode()
-        err = stderr.read().decode()
-        logging.info(f"[INFO] sbatch output:\n{out}")
-        print(f"SLURM job submitted successfully!")
-        if out.strip():
-            print(f"Job submission output: {out.strip()}")
-        # Only print sbatch error if it is not the known harmless module error
-        harmless_module_error = "Module ERROR: no such variable"
-        if err and harmless_module_error not in err:
-            logging.info(f"[ERROR] sbatch error:\n{err}")
-        else:
-            if err:
-                # Log the harmless error for reference
-                logging.info(f"[sbatch harmless stderr suppressed from terminal]: {err.strip()}")
-            logging.info("[INFO] Job script submitted on wilson via sbatch.")
-        ssh.close()
+            # Step 2: Ensure remote directory exists
+            ensure_remote_directory(sftp, processing_dir)
+            
+            # Step 3: Copy script to remote
+            copy_file_to_remote(sftp, script_path, remote_script_path)
+            
+        finally:
+            # Always close SFTP connection
+            sftp.close()
+        
+        # Step 4: Execute sbatch command
+        exit_status, stdout, stderr = execute_sbatch_command(
+            ssh_client, 
+            remote_script_name, 
+            processing_dir
+        )
+        
+        # Step 5: Validate and report results
+        validate_sbatch_result(exit_status, stdout, stderr)
+        
     except Exception as e:
-        logging.info(f"[ERROR] Failed to submit job on wilson: {e}")
-        print(f"ERROR: Failed to submit job on wilson: {e}")
-        logging.info(f"You can submit manually with:\n  scp {script_path} {user}@wilson:{remote_script_path}\n  ssh {user}@wilson 'cd {processing_dir} && sbatch {remote_script_name}'")
+        logging.error(f"Failed to submit job on wilson: {e}")
+        raise
 
-def resolve_dataset_path(path: str, crystal_name: str, processing_dir: str) -> str:
+
+def establish_wilson_connection() -> paramiko.SSHClient:
+    """Establish SSH connection using key-based authentication."""
+    user = os.environ.get("CLUSTER_USER", os.getlogin())
+    wilson_host = "wilson.diamond.ac.uk"
+    
+    ssh_key_path = os.path.expanduser("~/.ssh/id_rsa")
+    
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    
+    try:
+        ssh.connect(
+            wilson_host, 
+            username=user,
+            key_filename=ssh_key_path,
+            timeout=30,
+            banner_timeout=30
+        )
+        return ssh
+    except FileNotFoundError:
+        raise RuntimeError(f"SSH key not found: {ssh_key_path}")
+    except paramiko.AuthenticationException:
+        raise RuntimeError(f"SSH authentication failed for {user}@{wilson_host}")
+    except paramiko.SSHException as e:
+        raise RuntimeError(f"SSH connection failed: {e}")
+    except Exception as e:
+        raise RuntimeError(f"Unexpected error connecting to wilson: {e}")
+
+def resolve_dataset_paths(
+    crystal_name: str,
+    refinement_mtzfree: str,
+    dimple_path_pdb: str,
+    dimple_path_mtz: str,
+    base_dir: str
+) -> Optional[Dict[str, str]]:
     """
-    Resolves a dataset path, handling both absolute and relative paths.
-    If relative, constructs the full path using the processing directory and crystal name.
+    Resolve and validate all file paths for a dataset.
+    
+    Handles inconsistent database paths - works with:
+    - Full absolute paths
+    - Relative paths (joins with base_dir)
+    - Just filenames (assumes in model_building subdir)
+    
+    Args:
+        crystal_name: Crystal identifier
+        refinement_mtzfree: RefinementMTZfree path from database
+        dimple_path_pdb: DimplePathToPDB from database
+        dimple_path_mtz: DimplePathToMTZ from database
+        base_dir: Base processing directory
+        
+    Returns:
+        Dictionary with resolved paths or None if validation fails
+        Keys: 'refinement_mtzfree', 'dimple_pdb', 'dimple_mtz'
     """
-    if os.path.isabs(path):
-        return os.path.realpath(path)
+    # Log raw values from database
+    logging.debug(f"Raw database values for {crystal_name}:")
+    logging.debug(f"  RefinementMTZfree: {repr(refinement_mtzfree)}")
+    logging.debug(f"  DimplePathToPDB: {repr(dimple_path_pdb)}")
+    logging.debug(f"  DimplePathToMTZ: {repr(dimple_path_mtz)}")
+    
+    # Validate we have actual values
+    if not refinement_mtzfree or pd.isna(refinement_mtzfree):
+        logging.error(f"Missing RefinementMTZfree for {crystal_name}")
+        return None
+    
+    if not dimple_path_pdb or pd.isna(dimple_path_pdb):
+        logging.error(f"Missing DimplePathToPDB for {crystal_name}")
+        return None
+        
+    if not dimple_path_mtz or pd.isna(dimple_path_mtz):
+        logging.error(f"Missing DimplePathToMTZ for {crystal_name}")
+        return None
+    
+    # Resolve RefinementMTZfree: handle both filename and full path
+    refinement_mtzfree_clean = str(refinement_mtzfree).strip()
+    if os.path.isabs(refinement_mtzfree_clean):
+        # Database has full path - extract just the filename
+        logging.debug(f"RefinementMTZfree is absolute path, extracting basename")
+        refinement_mtzfree_filename = os.path.basename(refinement_mtzfree_clean)
     else:
-        return os.path.realpath(os.path.join(
-            processing_dir, "analysis", "model_building", crystal_name, path
-        ))
+        # Database has relative path or filename - use as-is
+        refinement_mtzfree_filename = refinement_mtzfree_clean
+    
+    refinement_mtzfree_path = resolve_path(
+        base_dir, 
+        "analysis", "model_building", crystal_name, 
+        refinement_mtzfree_filename,
+        must_exist=True
+    )
+    
+    # Resolve Dimple paths: handle both absolute and relative paths
+    dimple_path_pdb_clean = str(dimple_path_pdb).strip()
+    if os.path.isabs(dimple_path_pdb_clean):
+        logging.debug(f"DimplePathToPDB is absolute path")
+        dimple_path_pdb_resolved = dimple_path_pdb_clean if os.path.exists(dimple_path_pdb_clean) else None
+    else:
+        dimple_path_pdb_resolved = resolve_path(base_dir, dimple_path_pdb_clean, must_exist=True)
+    
+    dimple_path_mtz_clean = str(dimple_path_mtz).strip()
+    if os.path.isabs(dimple_path_mtz_clean):
+        logging.debug(f"DimplePathToMTZ is absolute path")
+        dimple_path_mtz_resolved = dimple_path_mtz_clean if os.path.exists(dimple_path_mtz_clean) else None
+    else:
+        dimple_path_mtz_resolved = resolve_path(base_dir, dimple_path_mtz_clean, must_exist=True)
+    
+    # Validate all paths exist
+    missing_paths = []
+    if not refinement_mtzfree_path:
+        expected = f"{base_dir}/analysis/model_building/{crystal_name}/{refinement_mtzfree_filename}"
+        missing_paths.append(f"RefinementMTZfree (tried: {expected})")
+    if not dimple_path_pdb_resolved:
+        missing_paths.append(f"DimplePathToPDB (tried: {dimple_path_pdb_clean})")
+    if not dimple_path_mtz_resolved:
+        missing_paths.append(f"DimplePathToMTZ (tried: {dimple_path_mtz_clean})")
+    
+    if missing_paths:
+        logging.error(f"Missing required file paths for {crystal_name}:")
+        for path in missing_paths:
+            logging.error(f"{path}")
+        return None
+    
+    # Log resolved paths
+    logging.debug(f"Resolved paths for {crystal_name}:")
+    logging.debug(f"RefinementMTZfree: {refinement_mtzfree_path}")
+    logging.debug(f"DimplePathToPDB: {dimple_path_pdb_resolved}")
+    logging.debug(f"DimplePathToMTZ: {dimple_path_mtz_resolved}")
+    
+    return {
+        'refinement_mtzfree': refinement_mtzfree_path,
+        'dimple_pdb': dimple_path_pdb_resolved,
+        'dimple_mtz': dimple_path_mtz_resolved
+    }
+
+
+def build_pipedream_command(
+    paths: Dict[str, str],
+    input_dir: str,
+    output_dir: str,
+    compound_code: str,
+    refinement_params: Dict[str, Any]
+) -> str:
+    """
+    Build Pipedream command from resolved paths and parameters.
+    
+    Args:
+        paths: Dictionary with resolved file paths (from resolve_dataset_paths)
+        input_dir: Input files directory
+        output_dir: Pipedream output directory
+        compound_code: Compound code
+        refinement_params: Refinement parameters dictionary
+        
+    Returns:
+        Complete Pipedream command string
+    """
+    pipedream_path, _ = get_buster_path('pipedream')
+    
+    # Build file paths relative to input_dir
+    hklin_file = os.path.join(input_dir, os.path.basename(paths['refinement_mtzfree']))
+    xyzin_file = os.path.join(input_dir, os.path.basename(paths['dimple_pdb']))
+    hklref_file = os.path.join(input_dir, os.path.basename(paths['dimple_mtz']))
+    expected_cif = os.path.join(input_dir, f"{compound_code}.cif")
+    
+    # Build base command
+    pipedream_cmd = (
+        f"{pipedream_path} -nolmr "
+        f"-hklin {hklin_file} "
+        f"-xyzin {xyzin_file} "
+        f"-hklref {hklref_file} "
+        f"-d {output_dir} "
+    )
+    
+    # Add refinement arguments
+    refinement_args = refinement_params_to_args(
+        refinement_params,
+        rhofit_file=expected_cif,
+        rhocommands=refinement_params.get('rhocommands')
+    )
+    
+    if refinement_args:
+        pipedream_cmd += refinement_args
+    
+    return pipedream_cmd.strip()
+
+
+def create_dataset_metadata(
+    input_dir: str,
+    output_dir: str,
+    compound_code: str,
+    smiles_string: str,
+    pipedream_cmd: str
+) -> Dict[str, Any]:
+    """
+    Create metadata dictionary for a processed dataset.
+    
+    Args:
+        input_dir: Input files directory
+        output_dir: Pipedream output directory
+        compound_code: Compound code
+        smiles_string: SMILES string
+        pipedream_cmd: Full Pipedream command
+        
+    Returns:
+        Dictionary with dataset metadata
+    """
+    return {
+        'Input_dir': input_dir,
+        'CompoundCode': compound_code,
+        'PipedreamDirectory': output_dir,
+        'ReportHTML': f"{output_dir}/report-{compound_code}/index.html",
+        'LigandReportHTML': f"{output_dir}/report-{compound_code}/ligand/index.html",
+        'ExpectedSummary': f"{output_dir}/pipedream_summary.json",
+        'PipedreamCommand': pipedream_cmd,
+        'ExpectedCIF': os.path.join(input_dir, f"{compound_code}.cif"),
+        'ExpectedPDB': os.path.join(input_dir, f"{compound_code}.pdb"),
+        'InputSMILES': smiles_string
+    }
+
+
+# Separate logic from I/O
+def validate_dataset_fields(row: pd.Series) -> Tuple[bool, List[str]]:
+    """Pure validation logic - easy to test."""
+    missing = []
+    if pd.isna(row.get('CrystalName')):
+        missing.append('CrystalName')
+    # ... more checks
+    return len(missing) == 0, missing
+
+def process_single_dataset(row, params, parent_dir, timestamp):
+    """Coordinates I/O - harder to test but smaller."""
+    is_valid, errors = validate_dataset_fields(row)
+    if not is_valid:
+        logging.error(f"Invalid dataset: {errors}")
+        return None
+    # Extract dataset fields
+    crystal_name, compound_code, refinement_mtzfree, dimple_path_pdb, dimple_path_mtz, compound_smiles = extract_dataset_fields(row)
+    
+    logging.debug(f"Processing dataset {crystal_name} (compound: {compound_code})")
+    
+    # Validate crystal name
+    if not crystal_name or pd.isna(crystal_name):
+        logging.error("Skipping dataset with missing CrystalName")
+        return None
+    
+    # Resolve and validate all file paths
+    paths = resolve_dataset_paths(
+        crystal_name,
+        refinement_mtzfree,
+        dimple_path_pdb,
+        dimple_path_mtz,
+        params['Processing_directory']
+    )
+    
+    if not paths:
+        logging.error(f"Failed to resolve paths for {crystal_name}")
+        return None
+    
+    # Setup directories
+    dataset_dir, input_dir = setup_dataset_directory(crystal_name, parent_dir)
+    
+    # Get and save SMILES
+    smiles_string = get_smiles_for_compound(
+        compound_code,
+        compound_smiles,
+        input_dir
+    )
+    
+    if not smiles_string:
+        logging.error(f"Skipping {crystal_name} - no valid SMILES available")
+        return None
+    
+    # Generate output directory
+    output_dir = f"{dataset_dir}/Pipedream_{timestamp}"
+    
+    # Copy files and prepare for restraint generation
+    files_ready = copy_input_files_and_prepare_for_restraints(
+        input_dir,
+        paths['refinement_mtzfree'],
+        paths['dimple_pdb'],
+        paths['dimple_mtz'],
+        compound_code,
+        smiles_string
+    )
+    
+    if not files_ready:
+        logging.error(f"Failed to prepare input files for {crystal_name}")
+        return None
+    
+    # Process PDB file if needed
+    process_pdb_file(input_dir, paths['dimple_pdb'], crystal_name, params)
+    
+    # Build Pipedream command
+    pipedream_cmd = build_pipedream_command(
+        paths,
+        input_dir,
+        output_dir,
+        compound_code,
+        params.get('Refinement_parameters', {})
+    )
+    
+    # Create and return metadata
+    return create_dataset_metadata(
+        input_dir,
+        output_dir,
+        compound_code,
+        smiles_string,
+        pipedream_cmd
+    )
+
+def get_buster_path(command_name: str) -> Tuple[str, str]:
+    """
+    Get the path to a BUSTER command, preferring module-loaded version.
+    
+    Args:
+        command_name: Name of the BUSTER command (e.g., 'buster-report', 'pipedream')
+        
+    Returns:
+        Tuple of (full path to command, source description: 'PATH', 'fallback', or 'not_found')
+    """
+    import subprocess
+    
+    try:
+        # Try to find the command in PATH (assumes module load buster has been run)
+        result = subprocess.run(
+            ['which', command_name],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        if result.returncode == 0 and result.stdout.strip():
+            path = result.stdout.strip()
+            logging.debug(f"Found {command_name} in PATH (from module): {path}")
+            return path, 'PATH'
+    except Exception as e:
+        logging.debug(f"Could not search PATH for {command_name}: {e}")
+    
+    # Fallback to hardcoded paths
+    fallback_paths = {
+        'buster-report': BUSTER_REPORT_PATH_FALLBACK,
+        'pipedream': BUSTER_PIPEDREAM_PATH_FALLBACK
+    }
+    
+    fallback_path = fallback_paths.get(command_name)
+    if fallback_path and os.path.exists(fallback_path):
+        logging.debug(f"Using fallback path for {command_name}: {fallback_path}")
+        return fallback_path, 'fallback'
+    elif fallback_path:
+        logging.warning(f"Fallback path for {command_name} does not exist: {fallback_path}")
+    
+    # Last resort: return command name and hope it's in PATH
+    logging.warning(f"Could not find {command_name}, will try to use from PATH")
+    return command_name, 'not_found'
+
+
+def check_buster_dependencies(verbose: bool = False) -> bool:
+    """Check if all BUSTER dependencies are available."""
+    try:
+        import subprocess
+        print("\nChecking BUSTER dependencies...")
+        logging.info("Running buster-report -checkdep")
+        
+        buster_report_cmd, source = get_buster_path('buster-report')
+        
+        if source == 'PATH':
+            logging.debug(f"Using buster-report from PATH: {buster_report_cmd}")
+        elif source == 'fallback':
+            logging.info(f"Using fallback buster-report: {buster_report_cmd}")
+        else:
+            print(f"⚠️  buster-report not found in expected locations, will try anyway")
+            logging.warning(f"buster-report location unknown, using: {buster_report_cmd}")
+        
+        # Run with output captured
+        result = subprocess.run(
+            [buster_report_cmd, '-checkdep'],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        output = result.stderr.strip() if result.stderr else result.stdout.strip()
+        
+        if verbose:
+            print("\n--- BUSTER Dependency Check Output ---")
+            print(output)
+            print("--- End of Output ---")
+        
+        if not verbose:
+            logging.debug(f"buster-report -checkdep output:\n{output}")
+        
+        if result.returncode == 0:
+            print("✓ All BUSTER dependencies are satisfied\n")
+            logging.info("All BUSTER dependencies satisfied")
+            return True
+        else:
+            if not verbose:
+                print("\n--- BUSTER Dependency Check Output (FAILED) ---")
+                print(output)
+                print("--- End of Output ---\n")
+            
+            print("!"*70)
+            print("! WARNING: BUSTER DEPENDENCY CHECK FAILED")
+            print("!"*70)
+            
+            # Try to identify specific missing dependencies
+            missing_deps = []
+            for line in output.split('\n'):
+                if 'not found' in line.lower() or 'missing' in line.lower() or 'error' in line.lower() or 'undefined' in line.lower():
+                    missing_deps.append(line.strip())
+            
+            if missing_deps:
+                print("\nMissing or problematic dependencies:")
+                for dep in missing_deps:
+                    print(f"  ! {dep}")
+                logging.warning(f"Missing dependencies: {missing_deps}")
+            
+            print("\n" + "!"*70)
+            print("! To resolve these issues:")
+            print("!   1. Run 'module load buster' before executing this script")
+            print("!   2. Ensure BUSTER environment is properly configured")
+            print("!   3. The cluster compute nodes will load BUSTER automatically")
+            print("!"*70 + "\n")
+            
+            return False
+            
+    except FileNotFoundError:
+        print("\n" + "!"*70)
+        print("! ERROR: buster-report command not found")
+        print("! ")
+        print("! Tried:")
+        print("!   1. System PATH (requires 'module load buster')")
+        print(f"!   2. Fallback path: {BUSTER_REPORT_PATH_FALLBACK}")
+        print("! ")
+        print("! To resolve this issue:")
+        print("!   - Run 'module load buster' before executing this script")
+        print("!   - Or update BUSTER_REPORT_PATH_FALLBACK in the script")
+        print("!"*70 + "\n")
+        logging.error("buster-report not found in PATH or at fallback location")
+        return False
+    except subprocess.TimeoutExpired:
+        print("\n" + "!"*70)
+        print("! ERROR: buster-report -checkdep timed out after 30 seconds")
+        print("!"*70 + "\n")
+        logging.error("buster-report -checkdep timed out")
+        return False
+    except Exception as e:
+        print(f"\n" + "!"*70)
+        print(f"! ERROR checking BUSTER dependencies: {e}")
+        print("!"*70 + "\n")
+        logging.error(f"Error checking BUSTER dependencies: {e}")
+        return False
+    
+
+def submit_single_job(
+    parent_dir: str,
+    num_datasets: int,
+    datasets_csv: str,
+    processing_dir: str,
+    refinement_params: Optional[Dict[str, Any]],
+    ssh_client: paramiko.SSHClient
+) -> None:
+    """
+    Submit a single SLURM array job (for datasets <= MAX_ARRAY_SIZE).
+    
+    Args:
+        parent_dir: Output directory
+        num_datasets: Number of datasets to process
+        datasets_csv: Path to CSV with dataset metadata
+        processing_dir: Base processing directory
+        refinement_params: Refinement parameters dict
+        ssh_client: Active SSH connection to wilson
+    """
+    script_path = os.path.join(parent_dir, "pipedream_array.sh")
+    
+    logging.info(f"Writing single job script for {num_datasets} datasets")
+    write_array_job_script(
+        datasets_csv=datasets_csv,
+        output_dir=parent_dir,
+        num_datasets=num_datasets,
+        script_path=script_path,
+        processing_dir=processing_dir,
+        refinement_params=refinement_params
+    )
+    
+    submit_sbatch_on_wilson(
+        script_path=script_path,
+        processing_dir=processing_dir,
+        ssh_client=ssh_client
+    )
+    
+    print(f"\n{format_separator()}")
+    print(f"Summary:")
+    print(f"Job submitted successfully")
+    print(f"Datasets: {num_datasets}")
+    print(f"Output directory: {parent_dir}")
+    print(f"Script: {script_path}")
+    print(f"{format_separator()}\n")
+    
+    logging.info(f"Single job submitted: {num_datasets} datasets")
+
+
+def submit_chunked_jobs(
+    parent_dir: str,
+    num_datasets: int,
+    datasets_csv: str,
+    processing_dir: str,
+    refinement_params: Optional[Dict[str, Any]],
+    ssh_client: paramiko.SSHClient
+) -> None:
+    """
+    Submit multiple SLURM array jobs (for datasets > MAX_ARRAY_SIZE).
+    
+    Each chunk processes up to MAX_ARRAY_SIZE datasets. This is necessary
+    because SLURM has limits on array job sizes.
+    
+    Args:
+        parent_dir: Output directory
+        num_datasets: Total number of datasets to process
+        datasets_csv: Path to CSV with dataset metadata
+        processing_dir: Base processing directory
+        refinement_params: Refinement parameters dict
+        ssh_client: Active SSH connection to wilson
+    """
+    num_chunks = (num_datasets + MAX_ARRAY_SIZE - 1) // MAX_ARRAY_SIZE
+    
+    print(f"\n⚠️  Large dataset: splitting {num_datasets} datasets into {num_chunks} job chunks")
+    print(f"   (Each chunk will process up to {MAX_ARRAY_SIZE} datasets)\n")
+    
+    logging.info(f"Chunking {num_datasets} datasets into {num_chunks} jobs")
+    
+    for chunk_idx in range(num_chunks):
+        start_idx = chunk_idx * MAX_ARRAY_SIZE
+        end_idx = min(start_idx + MAX_ARRAY_SIZE - 1, num_datasets - 1)
+        chunk_size = end_idx - start_idx + 1
+        
+        print(f"Preparing chunk {chunk_idx + 1}/{num_chunks}:")
+        print(f"  Datasets: {start_idx} to {end_idx} (total: {chunk_size})")
+        
+        script_path = os.path.join(parent_dir, f"pipedream_array_chunk_{chunk_idx}.sh")
+        
+        # Write script with array_offset for this chunk
+        logging.info(f"Writing chunk {chunk_idx + 1} script: array_offset={start_idx}, size={chunk_size}")
+        write_array_job_script(
+            datasets_csv=datasets_csv,
+            output_dir=parent_dir,
+            num_datasets=chunk_size,
+            script_path=script_path,
+            processing_dir=processing_dir,
+            refinement_params=refinement_params,
+            array_offset=start_idx
+        )
+        
+        print(f"Submitting chunk {chunk_idx + 1}...")
+        submit_sbatch_on_wilson(
+            script_path=script_path,
+            processing_dir=processing_dir,
+            ssh_client=ssh_client
+        )
+        print(f"✓ Chunk {chunk_idx + 1} submitted\n")
+        
+        logging.info(f"Chunk {chunk_idx + 1}/{num_chunks} submitted successfully")
+
+    print(f"\n{format_separator()}")
+    print(f"Successfully submitted {num_chunks} job chunks")
+    print(f"Total datasets: {num_datasets}")
+    print(f"Output directory: {parent_dir}")
+    print(f"Chunk size: {MAX_ARRAY_SIZE} datasets/chunk")
+    print(f"{format_separator()}\n")
+    
+    logging.info(f"All {num_chunks} chunks submitted successfully")
+
+
+def print_dry_run_summary(num_datasets: int, json_output_path: str) -> None:
+    """
+    Print summary of dry-run results.
+    
+    Args:
+        num_datasets: Number of datasets that would be processed
+        json_output_path: Path to generated JSON metadata file
+    """
+    print(f"\nDry run complete.")
+    
+    if num_datasets > 0:
+        print(f"✓ {num_datasets} datasets would be submitted for processing")
+        if num_datasets > MAX_ARRAY_SIZE:
+            num_chunks = (num_datasets + MAX_ARRAY_SIZE - 1) // MAX_ARRAY_SIZE
+            print(f"  Would be split into {num_chunks} job chunks")
+            print(f"  Each chunk processes up to {MAX_ARRAY_SIZE} datasets")
+    else:
+        print("✗ No datasets would be submitted (all filtered out)")
+
+    logging.debug(f"Dry run complete: {num_datasets} datasets prepared")
+    print(f"{format_separator()}\n")
+
+
+def log_and_print(message: str, level: str = "INFO") -> None:
+    """Log message and print to console."""
+    getattr(logging, level.lower())(message)
+    print(message)
+
+def format_separator(width: int = 76, char: str = '=') -> str:
+    return char * width
+
+@contextmanager
+def wilson_ssh_connection():
+    """Context manager for SSH connection lifecycle."""
+    ssh = None
+    try:
+        ssh = establish_wilson_connection()
+        yield ssh
+    finally:
+        if ssh:
+            try:
+                ssh.close()
+                logging.info("SSH connection closed")
+            except Exception as e:
+                logging.warning(f"Error closing SSH connection: {e}")
 
 if __name__ == "__main__":
     try:
+        # Parse arguments and setup
         args = parse_args()
         parameters_file = args.parameters
         
-        # Set up logging early with user preferences
+        print()
+        print(f"{format_separator()}")
+        print(f"Starting Pipedream XChem pipeline with parameters: {parameters_file}")
+        print(f"{format_separator()}")
+
         setup_logging(log_level=args.log_level, verbose=args.verbose)
         
-        if args.verbose:
-            print(f"Starting Pipedream XChem pipeline with parameters:")
-            print(f"  Parameters file: {parameters_file}")
-            print(f"  Log level: {args.log_level}")
-            print(f"  Dry run: {args.dry_run}")
-            if args.output_json:
-                print(f"  Custom JSON output: {args.output_json}")
-            if args.output_csv:
-                print(f"  Custom CSV output: {args.output_csv}")
+        # Check BUSTER dependencies
+        deps_ok = check_buster_dependencies(verbose=args.verbose)
+
+        if not deps_ok:
+            if args.dry_run:
+                print("⚠️  BUSTER dependency check failed, but continuing with dry-run.")
+                print("Note: Cluster compute nodes will load BUSTER modules automatically.\n")
+            else:
+                print("\n⚠️  BUSTER dependency check failed!")
+                print("\nNote: Cluster compute nodes will load BUSTER modules automatically,")
+                print("but this may indicate configuration issues that could affect job execution.")
+                print("\nDo you want to continue anyway? (y/N): ", end='')
+                response = input().strip().lower()
+                if response not in ['y', 'yes']:
+                    print("Exiting due to dependency issues.")
+                    sys.exit(1)
+                print("Continuing despite dependency issues...\n")
         
+        # Read configuration and get datasets
         print("Reading parameters and validating configuration...")
         params = read_yaml(parameters_file)
         validate_params(params)
+        
         print("Getting datasets from database...")
         datasets = get_datasets(params)
-        if datasets is not None and not datasets.empty:
-            parent_dir, num_valid_datasets, json_output_path = submit_jobs(
-                datasets, 
-                params, 
-                output_json_path=args.output_json,
-                output_csv_path=args.output_csv,
-                dry_run=args.dry_run
-            )
-            
-            if not args.dry_run:
-                # Write and submit array job script
-                datasets_csv = params['Filtered_dataset_csv_path']
-                output_dir = params.get('Output_directory') or params['Processing_directory']
-                script_path = os.path.join(parent_dir, 'pipedream_array_job.sh')
-                print("Writing SLURM array job script...")
-                write_array_job_script(datasets_csv, output_dir, num_valid_datasets, script_path, params['Processing_directory'], params.get('Refinement_parameters'))
-                logging.info(f"Submitting SLURM array job for {num_valid_datasets} datasets...")
-                print(f"Submitting SLURM array job for {num_valid_datasets} datasets...")
-                submit_sbatch_on_wilson(script_path, parent_dir)
+        
+        if datasets is None or datasets.empty:
+            print("No datasets found or retrieved from database.")
+            logging.warning("No datasets available for processing")
+            sys.exit(0)
+        
+        try:
+            # Submit jobs based on mode
+            if args.dry_run:
+                parent_dir, num_valid_datasets, json_output_path = submit_jobs(
+                    datasets, 
+                    params, 
+                    output_json_path=args.output_json,
+                    output_csv_path=args.output_csv,
+                    dry_run=args.dry_run,
+                    log_level=args.log_level,
+                    verbose=args.verbose
+                )
+                print_dry_run_summary(num_valid_datasets, json_output_path)
             else:
-                logging.info(f"DRY RUN complete. JSON metadata: {json_output_path}")
-                logging.info(f"DRY RUN complete. CSV datasets: {params['Filtered_dataset_csv_path']}")
-                print(f"DRY RUN complete.")
-                print(f"JSON metadata: {json_output_path}")
-                print(f"CSV datasets: {params['Filtered_dataset_csv_path']}")
-        else:
-            logging.warning("No datasets to process. Exiting.")
-            print("No datasets to process. Exiting.")
-            
-    except Exception as e:
-        import traceback
-        error_details = traceback.format_exc()
-        logging.error(f"Script execution failed: {e}")
-        logging.error(f"Full traceback: {error_details}")
-        print(f"ERROR: Script execution failed: {e}")
-        print(f"Check the log file for full error details.")
-        sys.exit(1)
+                with wilson_ssh_connection() as ssh_connection:
+                    parent_dir, num_valid_datasets, json_output_path = submit_jobs(
+                        datasets, 
+                        params, 
+                        output_json_path=args.output_json,
+                        output_csv_path=args.output_csv,
+                        dry_run=args.dry_run,
+                        log_level=args.log_level,
+                        verbose=args.verbose
+                    )
+                    
+                    if num_valid_datasets > MAX_ARRAY_SIZE:
+                        submit_chunked_jobs(
+                            parent_dir=parent_dir,
+                            num_datasets=num_valid_datasets,
+                            datasets_csv=params['Filtered_dataset_csv_path'],
+                            processing_dir=params['Processing_directory'],
+                            refinement_params=params.get('Refinement_parameters'),
+                            ssh_client=ssh_connection
+                        )
+                    else:
+                        submit_single_job(
+                            parent_dir=parent_dir,
+                            num_datasets=num_valid_datasets,
+                            datasets_csv=params['Filtered_dataset_csv_path'],
+                            processing_dir=params['Processing_directory'],
+                            refinement_params=params.get('Refinement_parameters'),
+                            ssh_client=ssh_connection
+                        )
+        
+        except KeyboardInterrupt:
+            print("\n\nOperation cancelled by user.")
+            logging.info("Operation cancelled by user (KeyboardInterrupt)")
+            sys.exit(1)
+        except Exception as e:
+            print(f"\n{'='*70}")
+            print(f"ERROR: {e}")
+            print(f"{'='*70}")
+            import traceback
+            traceback.print_exc()
+            logging.error(f"Fatal error: {e}", exc_info=True)
+            sys.exit(1)
 
+    except KeyboardInterrupt:
+        print("\n\nProcess interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        sys.exit(1)
