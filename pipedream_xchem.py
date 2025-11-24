@@ -6,7 +6,7 @@ generated from SMILES using grade2. It processes crystallographic datasets
 from an SQLite database and prepares them for automated refinement.
 
 Author: DFearon
-Date: 31st October 2025
+Date: November 2025
 """
 
 import os
@@ -59,6 +59,10 @@ MAX_ARRAY_SIZE = 1000
 DEFAULT_SBATCH_TIMEOUT = 30
 DEFAULT_CPUS_PER_TASK = 4
 DEFAULT_MEM_PER_CPU_MB = 4096
+DEFAULT_CLUSTER_PARTITION = "cs05r"
+DEFAULT_JOB_PRIORITY = "normal"
+VALID_PARTITIONS = ["cs05r", "cs04r"]
+VALID_PRIORITIES = ["normal", "low", "high"]
 
 # Software Paths (fallback if module load buster fails)
 BUSTER_PIPEDREAM_PATH_FALLBACK = "/dls_sw/apps/GPhL/BUSTER/20250717/scripts/pipedream"
@@ -305,6 +309,66 @@ def read_yaml(yaml_file: str) -> Dict[str, Any]:
         logging.error(f"Error reading YAML file: {e}")
         raise
 
+def validate_yaml_paths(params: Dict[str, Any]) -> bool:
+    """
+    Check if YAML contains placeholder paths that need to be replaced.
+    
+    Args:
+        params: Configuration parameters dictionary
+        
+    Returns:
+        True if no placeholders found, False otherwise
+        
+    Common placeholders:
+        - <proposal>
+        - <visit>
+        - <Pipedream_run>
+    """
+    placeholders = ['<proposal>', '<visit>', '<Pipedream_run>']
+    found_placeholders = []
+    
+    def check_value(key: str, value: Any, path: str = "") -> None:
+        """Recursively check for placeholders in nested structures."""
+        full_key = f"{path}.{key}" if path else key
+        
+        if isinstance(value, str):
+            for placeholder in placeholders:
+                if placeholder in value:
+                    found_placeholders.append({
+                        'key': full_key,
+                        'value': value,
+                        'placeholder': placeholder
+                    })
+        elif isinstance(value, dict):
+            for k, v in value.items():
+                check_value(k, v, full_key)
+        elif isinstance(value, list):
+            for i, item in enumerate(value):
+                check_value(f"{key}[{i}]", item, path)
+    
+    # Check all parameters
+    for key, value in params.items():
+        check_value(key, value)
+    
+    # Report findings
+    if found_placeholders:
+        logging.error("Configuration contains placeholder paths that must be replaced:")
+        print("\n" + "="*70)
+        print("ERROR: YAML Configuration Contains Placeholder Paths")
+        print("="*70)
+        for item in found_placeholders:
+            logging.error(f"  {item['key']}: {item['value']}")
+            print(f"  Parameter: {item['key']}")
+            print(f"  Value: {item['value']}")
+            print(f"  Found placeholder: {item['placeholder']}")
+            print()
+        print("Please replace these placeholders with actual paths before running.")
+        print("="*70 + "\n")
+        return False
+    
+    return True
+
+
 def validate_params(params: Dict[str, Any]) -> None:
     """Validate required parameters in the configuration."""
     required_keys = ['Database_path', 'Mode', 'Processing_directory', 'Refinement_parameters']
@@ -321,6 +385,21 @@ def validate_params(params: Dict[str, Any]) -> None:
 
     if params['Mode'] == 'specific_datasets' and 'Dataset_csv_path' not in params:
         raise ValueError("Missing 'Dataset_csv_path' for 'specific_datasets' mode")
+    
+    # Validate optional cluster configuration
+    if 'Cluster_partition' in params:
+        partition = params['Cluster_partition']
+        if partition not in VALID_PARTITIONS:
+            raise ValueError(f"Invalid Cluster_partition '{partition}'. Must be one of: {', '.join(VALID_PARTITIONS)}")
+    
+    if 'Job_priority' in params:
+        priority = params['Job_priority']
+        if priority not in VALID_PRIORITIES:
+            raise ValueError(f"Invalid Job_priority '{priority}'. Must be one of: {', '.join(VALID_PRIORITIES)}")
+    
+    # Check for placeholder paths
+    if not validate_yaml_paths(params):
+        raise ValueError("Configuration contains unresolved placeholder paths. Please update your YAML file with actual paths.")
 
 def get_datasets(params: Dict[str, Any]) -> pd.DataFrame:
     """Retrieve datasets from the database based on configuration parameters."""
@@ -453,13 +532,39 @@ def process_pdb_file(input_dir: str, dimple_path_pdb: str, crystal_name: str, pa
     """Remove crystallisation components from PDB file if requested."""
     if params.get("Remove_crystallisation_components", False):
         pdb_path = os.path.join(input_dir, os.path.basename(dimple_path_pdb))
+        logging.debug(f"Remove_crystallisation_components enabled for {crystal_name}")
+        logging.debug(f"Processing PDB file: {pdb_path}")
+        
         if pdb_path and os.path.exists(pdb_path):
             with open(pdb_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
+            
+            # Count removals by component type
+            original_count = len(lines)
+            components_to_remove = ["DMS", "EDO", "GOL", "SO4", "PO4", "PEG"]
+            removed_counts = {comp: 0 for comp in components_to_remove}
+            
+            kept_lines = []
+            for line in lines:
+                if any(res in line for res in components_to_remove):
+                    # Count which component was found
+                    for comp in components_to_remove:
+                        if comp in line:
+                            removed_counts[comp] += 1
+                            break
+                else:
+                    kept_lines.append(line)
+            
+            # Write cleaned file
             with open(pdb_path, 'w', encoding='utf-8') as f:
-                for line in lines:
-                    if not any(res in line for res in ["DMS", "EDO", "GOL", "SO4", "PO4", "PEG"]):
-                        f.write(line)
+                f.writelines(kept_lines)
+            
+            removed_total = original_count - len(kept_lines)
+            if removed_total > 0:
+                component_summary = ", ".join([f"{comp}: {count}" for comp, count in removed_counts.items() if count > 0])
+                logging.debug(f"Removed {removed_total} lines from {crystal_name} ({component_summary})")
+            else:
+                logging.debug(f"No crystallisation components found in {crystal_name}")
         else:
             logging.warning(f"PDB path missing or does not exist for {crystal_name}: {pdb_path}")
 
@@ -697,13 +802,15 @@ def refinement_params_to_args(
     
     return " ".join(args)
 
-def generate_slurm_header(num_datasets: int, array_offset: int = 0) -> str:
+def generate_slurm_header(num_datasets: int, array_offset: int = 0, partition: str = DEFAULT_CLUSTER_PARTITION, priority: str = DEFAULT_JOB_PRIORITY) -> str:
     """
     Generate SLURM job script header with directives.
     
     Args:
         num_datasets: Number of datasets to process
         array_offset: Offset for chunked arrays (default 0)
+        partition: Cluster partition to use (default: cs05r)
+        priority: Job priority level (default: normal)
         
     Returns:
         String with SLURM header directives
@@ -711,10 +818,19 @@ def generate_slurm_header(num_datasets: int, array_offset: int = 0) -> str:
     array_max = num_datasets - 1
     max_concurrent = min(MAX_CONCURRENT_JOBS, num_datasets)
     
+    # Build priority directive based on priority level
+    # Use --nice for priority (positive = lower priority, negative = higher priority)
+    priority_directive = ""
+    if priority == "low":
+        priority_directive = "#SBATCH --nice=1000\n"  # Low priority (runs after others)
+    elif priority == "high":
+        priority_directive = "#SBATCH --nice=-100\n"  # High priority
+    # normal priority doesn't need a directive
+    
     return f"""#!/bin/bash
 #SBATCH --job-name=pipedream_array
-#SBATCH --partition=cs05r
-#SBATCH --cpus-per-task=4
+#SBATCH --partition={partition}
+{priority_directive}#SBATCH --cpus-per-task=4
 #SBATCH --mem-per-cpu=4096
 #SBATCH --array=0-{array_max}%{max_concurrent}
 #SBATCH --output=array_logs/pipedream_array_%A_%a.out
@@ -880,16 +996,131 @@ fi
 
 def generate_pipedream_execution_section() -> str:
     """
-    Generate Pipedream execution and cleanup section.
+    Generate Pipedream execution, post-processing, and cleanup section.
+    
+    Post-processing includes:
+    - Map generation (2fofc and fofc) using gemmi
+    - Edstats analysis for ligand RSR calculation
     
     Returns:
-        String with bash code for running Pipedream
+        String with bash code for running Pipedream and post-processing
     """
     return """
 # Run Pipedream
 CMD=$(echo "$PipedreamCommand" | sed 's/^"//;s/"$//' | tr -s ' ')
 echo "Running command: $CMD"
 bash -c "$CMD"
+PIPEDREAM_EXIT=$?
+
+if [ $PIPEDREAM_EXIT -ne 0 ]; then
+  echo "[ERROR] Pipedream failed with exit code: $PIPEDREAM_EXIT"
+  exit $PIPEDREAM_EXIT
+fi
+
+echo "[INFO] Pipedream completed successfully"
+
+# Post-processing: Generate maps and run edstats
+echo "[INFO] Starting post-processing (map generation and edstats)..."
+
+# Find the postrefine directory
+POSTREFINE_DIR="$OUTPUT_DIR/postrefine-$CompoundCode"
+
+if [ -d "$POSTREFINE_DIR" ]; then
+  MTZ_FILE="$POSTREFINE_DIR/refine.mtz"
+  PDB_FILE="$POSTREFINE_DIR/refine.pdb"
+  
+  if [ -f "$MTZ_FILE" ] && [ -f "$PDB_FILE" ]; then
+    # Generate 2fofc map
+    echo "[INFO] Generating 2fofc map..."
+    MAP_2FOFC="$POSTREFINE_DIR/refine_2fofc.map"
+    gemmi sf2map --sample 5 "$MTZ_FILE" "$MAP_2FOFC" 2>&1
+    
+    if [ -f "$MAP_2FOFC" ]; then
+      echo "[INFO] Successfully generated 2fofc map: $MAP_2FOFC"
+    else
+      echo "[WARNING] Failed to generate 2fofc map"
+    fi
+    
+    # Generate fofc map
+    echo "[INFO] Generating fofc (difference) map..."
+    MAP_FOFC="$POSTREFINE_DIR/refine_fofc.map"
+    gemmi sf2map --sample 5 -d "$MTZ_FILE" "$MAP_FOFC" 2>&1
+    
+    if [ -f "$MAP_FOFC" ]; then
+      echo "[INFO] Successfully generated fofc map: $MAP_FOFC"
+    else
+      echo "[WARNING] Failed to generate fofc map"
+    fi
+    
+    # Run edstats if both maps exist
+    if [ -f "$MAP_2FOFC" ] && [ -f "$MAP_FOFC" ]; then
+      echo "[INFO] Running edstats..."
+      EDSTATS_OUT="$POSTREFINE_DIR/edstats.out"
+      
+      # Check if CCP4 is loaded (edstats is from CCP4)
+      if command -v edstats &> /dev/null; then
+        # Extract resolution values from pipedream_summary.json
+        SUMMARY_JSON="$OUTPUT_DIR/pipedream_summary.json"
+        
+        if [ -f "$SUMMARY_JSON" ]; then
+          # Use Python to extract resolution values from JSON
+          RESOLUTION_VALUES=$(python3 -c "
+import json
+import sys
+try:
+    with open('$SUMMARY_JSON', 'r') as f:
+        data = json.load(f)
+    reslo = data.get('dataprocessing', {}).get('inputdata', {}).get('reslo', None)
+    reshi = data.get('dataprocessing', {}).get('inputdata', {}).get('reshigh', None)
+    if reslo is not None and reshi is not None:
+        print(f'{reslo} {reshi}')
+    else:
+        sys.exit(1)
+except Exception as e:
+    sys.stderr.write(f'Error extracting resolution: {e}\n')
+    sys.exit(1)
+" 2>&1)
+          
+          if [ $? -eq 0 ] && [ -n "$RESOLUTION_VALUES" ]; then
+            read RESLO RESHI <<< "$RESOLUTION_VALUES"
+            echo "[INFO] Using resolution range: RESLO=$RESLO RESHI=$RESHI"
+            
+            # Run edstats with proper CCP4 syntax
+            edstats XYZIN "$PDB_FILE" MAPIN1 "$MAP_2FOFC" MAPIN2 "$MAP_FOFC" OUT "$EDSTATS_OUT" << EOF
+RESLO=$RESLO
+RESHI=$RESHI
+END
+EOF
+            EDSTATS_EXIT=$?
+            
+            if [ $EDSTATS_EXIT -eq 0 ] && [ -f "$EDSTATS_OUT" ]; then
+              echo "[INFO] Successfully ran edstats: $EDSTATS_OUT"
+            else
+              echo "[WARNING] edstats failed with exit code: $EDSTATS_EXIT"
+            fi
+          else
+            echo "[WARNING] Could not extract resolution values from $SUMMARY_JSON"
+            echo "[INFO] Skipping edstats - resolution values required"
+          fi
+        else
+          echo "[WARNING] Summary JSON not found: $SUMMARY_JSON"
+          echo "[INFO] Skipping edstats - cannot determine resolution range"
+        fi
+      else
+        echo "[WARNING] edstats command not found - skipping RSR calculation"
+        echo "[INFO] Load CCP4 module if edstats is needed: module load ccp4"
+      fi
+    else
+      echo "[WARNING] Cannot run edstats - maps not generated"
+    fi
+  else
+    echo "[WARNING] MTZ or PDB file not found in postrefine directory"
+  fi
+else
+  echo "[WARNING] Postrefine directory not found: $POSTREFINE_DIR"
+fi
+
+echo "[INFO] Post-processing complete"
 
 # Cleanup setvar files
 if compgen -G "__*.setvar.lis" > /dev/null; then
@@ -905,7 +1136,9 @@ def write_array_job_script(
     script_path: str, 
     processing_dir: str, 
     refinement_params: Optional[Dict[str, Any]] = None,
-    array_offset: int = 0
+    array_offset: int = 0,
+    cluster_partition: str = DEFAULT_CLUSTER_PARTITION,
+    job_priority: str = DEFAULT_JOB_PRIORITY
 ) -> None:
     """
     Write SLURM array job script for batch processing.
@@ -918,6 +1151,8 @@ def write_array_job_script(
         processing_dir: Base processing directory
         refinement_params: Refinement parameters dict (currently unused)
         array_offset: Offset for chunked job arrays (default 0)
+        cluster_partition: Cluster partition to use (default: cs05r)
+        job_priority: Job priority level (default: normal)
         
     Raises:
         ValueError: If num_datasets exceeds MAX_ARRAY_SIZE or is < 1
@@ -944,13 +1179,15 @@ def write_array_job_script(
     
     # Log configuration
     logging.info(f"Writing SLURM script: {script_path}")
+    logging.info(f"  Cluster partition: {cluster_partition}")
+    logging.info(f"  Job priority: {job_priority}")
     logging.info(f"  Array range: 0-{num_datasets-1} (offset: {array_offset})")
     logging.info(f"  CSV line offset: {array_offset + 2}")
     logging.info(f"  Max concurrent: {min(MAX_CONCURRENT_JOBS, num_datasets)}")
     
     # Build script by concatenating sections
     script_sections = [
-        generate_slurm_header(num_datasets, array_offset),
+        generate_slurm_header(num_datasets, array_offset, cluster_partition, job_priority),
         generate_environment_setup(),
         generate_csv_parsing_section(datasets_csv, processing_dir, array_offset),
         generate_directory_setup_section(output_dir),
@@ -1680,7 +1917,7 @@ def submit_single_job(
     num_datasets: int,
     datasets_csv: str,
     processing_dir: str,
-    refinement_params: Optional[Dict[str, Any]],
+    params: Dict[str, Any],
     ssh_client: paramiko.SSHClient
 ) -> None:
     """
@@ -1691,10 +1928,14 @@ def submit_single_job(
         num_datasets: Number of datasets to process
         datasets_csv: Path to CSV with dataset metadata
         processing_dir: Base processing directory
-        refinement_params: Refinement parameters dict
+        params: Full parameters dict (includes refinement params and cluster config)
         ssh_client: Active SSH connection to wilson
     """
     script_path = os.path.join(parent_dir, "pipedream_array.sh")
+    
+    # Extract cluster configuration with defaults
+    cluster_partition = params.get('Cluster_partition', DEFAULT_CLUSTER_PARTITION)
+    job_priority = params.get('Job_priority', DEFAULT_JOB_PRIORITY)
     
     logging.info(f"Writing single job script for {num_datasets} datasets")
     write_array_job_script(
@@ -1703,7 +1944,9 @@ def submit_single_job(
         num_datasets=num_datasets,
         script_path=script_path,
         processing_dir=processing_dir,
-        refinement_params=refinement_params
+        refinement_params=params.get('Refinement_parameters'),
+        cluster_partition=cluster_partition,
+        job_priority=job_priority
     )
     
     submit_sbatch_on_wilson(
@@ -1728,7 +1971,7 @@ def submit_chunked_jobs(
     num_datasets: int,
     datasets_csv: str,
     processing_dir: str,
-    refinement_params: Optional[Dict[str, Any]],
+    params: Dict[str, Any],
     ssh_client: paramiko.SSHClient
 ) -> None:
     """
@@ -1742,10 +1985,14 @@ def submit_chunked_jobs(
         num_datasets: Total number of datasets to process
         datasets_csv: Path to CSV with dataset metadata
         processing_dir: Base processing directory
-        refinement_params: Refinement parameters dict
+        params: Full parameters dict (includes refinement params and cluster config)
         ssh_client: Active SSH connection to wilson
     """
     num_chunks = (num_datasets + MAX_ARRAY_SIZE - 1) // MAX_ARRAY_SIZE
+    
+    # Extract cluster configuration with defaults
+    cluster_partition = params.get('Cluster_partition', DEFAULT_CLUSTER_PARTITION)
+    job_priority = params.get('Job_priority', DEFAULT_JOB_PRIORITY)
     
     print(f"\n⚠️  Large dataset: splitting {num_datasets} datasets into {num_chunks} job chunks")
     print(f"   (Each chunk will process up to {MAX_ARRAY_SIZE} datasets)\n")
@@ -1770,8 +2017,10 @@ def submit_chunked_jobs(
             num_datasets=chunk_size,
             script_path=script_path,
             processing_dir=processing_dir,
-            refinement_params=refinement_params,
-            array_offset=start_idx
+            refinement_params=params.get('Refinement_parameters'),
+            array_offset=start_idx,
+            cluster_partition=cluster_partition,
+            job_priority=job_priority
         )
         
         print(f"Submitting chunk {chunk_idx + 1}...")
@@ -1920,7 +2169,7 @@ if __name__ == "__main__":
                             num_datasets=num_valid_datasets,
                             datasets_csv=params['Filtered_dataset_csv_path'],
                             processing_dir=params['Processing_directory'],
-                            refinement_params=params.get('Refinement_parameters'),
+                            params=params,
                             ssh_client=ssh_connection
                         )
                     else:
@@ -1929,7 +2178,7 @@ if __name__ == "__main__":
                             num_datasets=num_valid_datasets,
                             datasets_csv=params['Filtered_dataset_csv_path'],
                             processing_dir=params['Processing_directory'],
-                            refinement_params=params.get('Refinement_parameters'),
+                            params=params,
                             ssh_client=ssh_connection
                         )
         

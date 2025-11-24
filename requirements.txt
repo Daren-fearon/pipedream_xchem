@@ -1,0 +1,15 @@
+# Python package dependencies for Pipedream XChem
+# Generated from environment.yml for pip-based installations
+# For conda/micromamba installations, use: micromamba env create -f environment.yml
+
+gemmi
+jinja2
+matplotlib
+numpy
+pandas
+paramiko
+plotly
+pyyaml
+rdkit
+scikit-learn
+tqdm

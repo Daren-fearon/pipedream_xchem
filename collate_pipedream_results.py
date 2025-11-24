@@ -1,4 +1,4 @@
-"""
+﻿"""
 Pipedream Results Collation and Analysis Script
 
 This script collates and analyzes results from completed Pipedream crystallographic 
@@ -12,10 +12,9 @@ Features:
 - MolProbity and structural quality metrics analysis
 - SMILES extraction from refined ligand structures
 - Interactive HTML reports with file links and data filtering
-- Map file generation from MTZ files using gemmi
 
 Author: DFearon
-Date: October 2025
+Date: November 2025
 """
 
 import os
@@ -23,24 +22,57 @@ import json
 import pandas as pd
 import logging
 import argparse
-import sys
 import traceback
 from datetime import datetime
 import webbrowser
-import subprocess
 from collections import OrderedDict
-from typing import Any, Dict, List, Tuple, Optional, Protocol, TypedDict, Union, Literal
+from typing import Any, Dict, List, Tuple, Optional, TypedDict, Union
 from rdkit import Chem
 from rdkit.Chem import AllChem
 from rdkit.Geometry import Point3D
 import gemmi
 from dataclasses import dataclass
 from pathlib import Path
-from contextlib import contextmanager
-from enum import Enum, auto
+from enum import Enum
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+
+# Import extracted modules
+from pipedream_plots import (
+    generate_pca_plots,
+    generate_ligand_quality_plot,
+    generate_pdb_percentile_quality_plot,
+    generate_individual_pdb_percentile_plot,
+    generate_spider_plot,
+    generate_individual_batch_percentile_plot
+)
+from pipedream_thresholds import ValidationThresholds, THRESHOLDS
+
+# Try to import plotly for interactive plots
+try:
+    import plotly.graph_objects as go
+    HAS_PLOTLY = True
+except ImportError:
+    HAS_PLOTLY = False
+    logging.debug("plotly not available, will use static matplotlib plots")
+
+# Try to import tqdm for progress bar
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+    logging.debug("tqdm not available, progress bar will not be shown")
+
+# Import Jinja2 for HTML templating
+from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 # Version information
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 # Constants
 @dataclass
@@ -50,7 +82,6 @@ class ProcessingConfig:
     mcs_timeout_seconds: int = 30
     min_mcs_atoms: int = 5
     max_debug_files_display: int = 5
-    gemmi_timeout_seconds: int = 30
 
 @dataclass
 class OutputConfig:
@@ -92,46 +123,192 @@ class MapType(str, Enum):
     TWOFOFC = "2fofc"
     FOFC = "fofc"
 
-def check_gemmi_availability():
+class Config:
+    """Configuration class for external tool paths and settings."""
+    
+    def __init__(self):
+        """Initialize configuration with default paths."""
+        # Default paths to search for PDB PCA reference data
+        self.pca_reference_paths = [
+            Path(__file__).parent / 'Data' / 'PCA_PDB_references.csv',  # Next to script
+            Path(__file__).parent / 'PCA_PDB_references.csv',  # In script directory
+            Path('Data/PCA_PDB_references.csv'),  # Relative path
+            Path('PCA_PDB_references.csv')  # Current directory
+        ]
+
+class PCAReference:
     """
-    Check if gemmi is available and return the command to use.
+    Class to load PDB archive reference data and calculate PCA percentile scores.
+    Based on calculateCompositeScore.py by Chenghua Shao (2020).
     
-    Returns:
-        Tuple[bool, Optional[List[str]]]: (is_available, command)
+    This provides absolute quality assessment by comparing against the entire PDB archive,
+    in contrast to batch-relative scoring.
     """
-    # Try direct gemmi command first
-    try:
-        result = subprocess.run(['gemmi', '--version'], 
-                              capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            logging.debug(f"gemmi command available: {result.stdout.strip()}")
-            return True, ['gemmi']
-    except (FileNotFoundError, subprocess.TimeoutExpired, Exception) as e:
-        logging.debug(f"Direct gemmi command not available: {e}")
     
-    # Try python -m gemmi as fallback
-    try:
-        result = subprocess.run([sys.executable, '-m', 'gemmi', '--version'], 
-                              capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            logging.debug(f"python -m gemmi available: {result.stdout.strip()}")
-            return True, [sys.executable, '-m', 'gemmi']
-    except Exception as e:
-        logging.debug(f"python -m gemmi not available: {e}")
+    def __init__(self):
+        """Initialize empty reference data structures."""
+        self.d_ref = {}  # Reference data from PDB archive
+        self.d_par = {}  # Calculated PCA parameters (means, stds, loadings)
+        self.loaded = False
     
-    # Try BUSTER gemmi path as final fallback
-    buster_gemmi_path = '/dls_sw/apps/GPhL/BUSTER/20240123/autoBUSTER/bin/linux64/gemmi'
-    try:
-        result = subprocess.run([buster_gemmi_path, '--version'], 
-                              capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            logging.debug(f"BUSTER gemmi available: {result.stdout.strip()}")
-            return True, [buster_gemmi_path]
-    except Exception as e:
-        logging.debug(f"BUSTER gemmi not available: {e}")
+    def load_reference(self, filepath: str) -> bool:
+        """
+        Load reference PDB archive data from CSV file.
+        
+        Args:
+            filepath: Path to PCA_PDB_references.csv file
+            
+        Returns:
+            True if loaded successfully, False otherwise
+        """
+        try:
+            self._read_pca_references(filepath)
+            self._calculate_pca_parameters()
+            self.loaded = True
+            logging.info(f"Loaded PDB PCA reference data from: {filepath}")
+            return True
+        except Exception as e:
+            logging.warning(f"Failed to load PDB PCA reference data from {filepath}: {e}")
+            self.loaded = False
+            return False
     
-    logging.debug("No gemmi installation found")
-    return False, None
+    def _read_pca_references(self, filepath: str):
+        """Load reference data as dictionary with columns as keys."""
+        import csv
+        
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"Reference file not found: {filepath}")
+        
+        with open(filepath, 'r') as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            
+            if header is None:
+                raise ValueError("Empty CSV file")
+            
+            # Initialize lists for each column (skip first column - usually ID)
+            for item in header[1:]:
+                self.d_ref[item] = []
+            
+            # Read data rows
+            for line in reader:
+                for item, value in zip(header[1:], line[1:]):
+                    self.d_ref[item].append(float(value))
+        
+        logging.debug(f"Loaded {len(self.d_ref.get('rsr', []))} reference structures from PDB archive")
+    
+    def _calculate_pca_parameters(self):
+        """Calculate PCA parameters (mean, std, loading) for each variable."""
+        from math import sqrt
+        import numpy as np
+        
+        for var in ["rsr", "rscc", "mogul_bonds_rmsz", "mogul_angles_rmsz"]:
+            if var not in self.d_ref:
+                raise ValueError(f"Missing required column '{var}' in reference data")
+            
+            self.d_par[var] = {}
+            l_value = self.d_ref[var]
+            self.d_par[var]["mean"] = np.mean(l_value)
+            self.d_par[var]["std"] = np.std(l_value)
+            self.d_par[var]["loading"] = sqrt(2) / 2.0
+        
+        # RSCC loading must be negative (opposite to RSR)
+        self.d_par["rscc"]["loading"] = -self.d_par["rscc"]["loading"]
+        
+        logging.debug(f"PDB archive parameters - RSR: mean={self.d_par['rsr']['mean']:.3f}, std={self.d_par['rsr']['std']:.3f}")
+        logging.debug(f"PDB archive parameters - RSCC: mean={self.d_par['rscc']['mean']:.3f}, std={self.d_par['rscc']['std']:.3f}")
+    
+    def _get_ranking_percentile(self, score: float, ref_list: list) -> float:
+        """
+        Calculate ranking percentile of a score within a reference list.
+        
+        Args:
+            score: PC1 score to rank
+            ref_list: Reference list of PC1 scores from PDB archive
+            
+        Returns:
+            Percentile (0-1) where 1.0 = best quality, 0.0 = worst quality
+        """
+        # Create a copy and add new score
+        ref_copy = ref_list.copy()
+        ref_copy.append(score)
+        
+        # Sort the list
+        sorted_list = sorted(ref_copy)
+        
+        # Count how many values are less than this score (handles ties correctly)
+        rank = sum(1 for x in sorted_list if x < score)
+        
+        # Calculate percentile
+        if len(ref_copy) > 1:
+            percentile = rank / float(len(ref_copy) - 1)
+        else:
+            percentile = 0.5
+        
+        # Invert so best (highest rank) = 1.0
+        return 1 - percentile
+    
+    def calculate_fit_score(self, ligand_cc: float, ligand_rsr: float) -> Optional[float]:
+        """
+        Calculate fit quality percentile score vs PDB archive.
+        
+        Args:
+            ligand_cc: Ligand correlation coefficient (equivalent to RSCC)
+            ligand_rsr: Ligand real space R-factor
+            
+        Returns:
+            Percentile score (0-100) or None if calculation fails
+        """
+        if not self.loaded:
+            return None
+        
+        try:
+            # Calculate fit PC1
+            fit_pc1 = ((ligand_rsr - self.d_par["rsr"]["mean"]) / self.d_par["rsr"]["std"]) * \
+                      self.d_par["rsr"]["loading"] + \
+                      ((ligand_cc - self.d_par["rscc"]["mean"]) / self.d_par["rscc"]["std"]) * \
+                      self.d_par["rscc"]["loading"]
+            
+            # Get percentile vs PDB archive
+            percentile = self._get_ranking_percentile(fit_pc1, self.d_ref["fit_pc1"])
+            
+            return percentile * 100  # Convert to 0-100 scale
+            
+        except (KeyError, ZeroDivisionError, TypeError, ValueError) as e:
+            logging.debug(f"Failed to calculate PDB fit score: {e}")
+            return None
+    
+    def calculate_geometry_score(self, mogul_z_bond: float, mogul_z_angle: float) -> Optional[float]:
+        """
+        Calculate geometry quality percentile score vs PDB archive.
+        
+        Args:
+            mogul_z_bond: Mogul Z-score for bonds
+            mogul_z_angle: Mogul Z-score for angles
+            
+        Returns:
+            Percentile score (0-100) or None if calculation fails
+        """
+        if not self.loaded:
+            return None
+        
+        try:
+            # Calculate geometry PC1
+            geo_pc1 = ((mogul_z_bond - self.d_par["mogul_bonds_rmsz"]["mean"]) / 
+                       self.d_par["mogul_bonds_rmsz"]["std"]) * \
+                      self.d_par["mogul_bonds_rmsz"]["loading"] + \
+                      ((mogul_z_angle - self.d_par["mogul_angles_rmsz"]["mean"]) / 
+                       self.d_par["mogul_angles_rmsz"]["std"]) * \
+                      self.d_par["mogul_angles_rmsz"]["loading"]
+            
+            # Get percentile vs PDB archive
+            percentile = self._get_ranking_percentile(geo_pc1, self.d_ref["geo_pc1"])
+            
+            return percentile * 100  # Convert to 0-100 scale
+            
+        except (KeyError, ZeroDivisionError, TypeError, ValueError) as e:
+            logging.debug(f"Failed to calculate PDB geometry score: {e}")
+            return None
 
 # CIF/PDB handling functions (from compare_chirality.py)
 def load_mol_from_cif(cif_path: str) -> Chem.Mol:
@@ -263,128 +440,694 @@ def assign_coordinates_from_pdb(mol: Chem.Mol, pdb_path: str, dataset_name: str 
     return mol_with_h
 
 def compare_chiral_centers_cif_pdb(input_cif, input_pdb, output_cif, output_pdb, smiles_file, dataset_name="Unknown"):
-    """Compare stereochemistry using CIF files for topology and PDB files for coordinates."""
+    """
+    Compare stereochemistry between input and output structures.
+    
+    Prefers CIF files for topology (authoritative stereochemistry from refinement restraints),
+    but falls back to SMILES template approach when CIF files are unavailable.
+    
+    Args:
+        input_cif: Path to input CIF file (or 'NA' if unavailable)
+        input_pdb: Path to input PDB file (or 'NA' if unavailable)
+        output_cif: Path to output CIF file (or 'NA' if unavailable)
+        output_pdb: Path to output PDB file
+        smiles_file: Path to input SMILES file
+        dataset_name: Name of dataset for logging
+    
+    Returns:
+        Tuple of (chirality_result, output_smiles, heavy_atom_count)
+        Result will be prefixed with "[CIF]" or "[SMILES fallback]" to indicate method used
+    """
+    # Check which files are available
+    has_input_cif = input_cif and input_cif != 'NA' and os.path.isfile(input_cif)
+    has_output_cif = output_cif and output_cif != 'NA' and os.path.isfile(output_cif)
+    has_smiles = smiles_file and smiles_file != 'NA' and os.path.isfile(smiles_file)
+    has_output_pdb = output_pdb and output_pdb != 'NA' and os.path.isfile(output_pdb)
+    
+    if not has_output_pdb:
+        return "Output PDB not found", "NA", 0
+    if not has_smiles:
+        return "Input SMILES not found", "NA", 0
+    
+    # Determine which method to use
+    use_cif_method = has_input_cif and has_output_cif
+    
     try:
         # Load reference SMILES
-        with open(smiles_file, 'r') as f:
-            smiles = f.readline().strip()
-
-        # Process input molecule
-        logging.debug(f"Loading input CIF: {input_cif}")
-        mol_input = load_mol_from_cif(input_cif)
+        with open(smiles_file, 'r', encoding='utf-8') as f:
+            smiles_line = f.readline().strip()
+        smiles = smiles_line.split()[0] if smiles_line else ""
         
-        # Assign coordinates from input PDB if available, otherwise use CIF coordinates
-        if input_pdb and input_pdb != 'NA' and os.path.isfile(input_pdb):
-            logging.debug(f"Assigning coordinates from input PDB: {input_pdb}")
-            mol_input = assign_coordinates_from_pdb(mol_input, input_pdb, dataset_name, "input")
-        else:
-            logging.debug(f"No input PDB available, using CIF coordinates for input molecule")
-            # Ensure stereochemistry is assigned from the CIF 3D coordinates
-            Chem.AssignStereochemistryFrom3D(mol_input)
-
-        # Process output molecule - use CIF topology + PDB coordinates
-        logging.debug(f"Loading output CIF: {output_cif}")
-        mol_output = load_mol_from_cif(output_cif)
-        logging.debug(f"Assigning coordinates from output PDB: {output_pdb}")
-        mol_output = assign_coordinates_from_pdb(mol_output, output_pdb, dataset_name, "output")
-
-        # Find chiral centers
-        chiral_input = Chem.FindMolChiralCenters(mol_input, includeUnassigned=True)
-        chiral_output = Chem.FindMolChiralCenters(mol_output, includeUnassigned=True)
-
-        # Generate SMILES without explicit hydrogens - handle potential errors
-        try:
-            mol_input_no_h = Chem.RemoveHs(mol_input)
-            smiles_input = Chem.MolToSmiles(mol_input_no_h, isomericSmiles=True)
-        except Exception as e:
-            logging.warning(f"Failed to generate input SMILES: {e}")
-            smiles_input = "Failed to generate"
+        if not smiles:
+            return f"Empty or invalid SMILES file: {smiles_file}", "NA", 0
+        
+        # ============ METHOD 1: CIF TOPOLOGY (PREFERRED) ============
+        if use_cif_method:
+            logging.debug(f"Using CIF topology method for {dataset_name}")
             
-        try:
-            mol_output_no_h = Chem.RemoveHs(mol_output)
-            smiles_output = Chem.MolToSmiles(mol_output_no_h, isomericSmiles=True)
-        except Exception as e:
-            logging.warning(f"Failed to generate output SMILES: {e}")
-            smiles_output = "Failed to generate"
-
-        # Compare chiral centers
-        differences = []
-        input_dict = {idx: config for idx, config in chiral_input}
-        output_dict = {idx: config for idx, config in chiral_output}
-        
-        all_chiral_indices = set(input_dict.keys()) | set(output_dict.keys())
-        
-        for idx in all_chiral_indices:
-            input_config = input_dict.get(idx, 'Not found')
-            output_config = output_dict.get(idx, 'Not found')
-            if input_config != output_config:
-                differences.append(f"Atom {idx}: {input_config} → {output_config}")
-
-        if differences:
-            result = f"Chiral centre inverted:\n{'; '.join(differences)}"
-        else:
-            result = "Output stereochemistry matches input"
+            # Process input molecule
+            logging.debug(f"Loading input CIF: {input_cif}")
+            mol_input = load_mol_from_cif(input_cif)
             
-        logging.debug(f"Input chiral centers: {chiral_input}")
-        logging.debug(f"Output chiral centers: {chiral_output}")
-        logging.debug(f"Reference SMILES: {smiles}")
-        logging.debug(f"Input SMILES: {smiles_input}")
-        logging.debug(f"Output SMILES: {smiles_output}")
+            # Assign coordinates from input PDB if available, otherwise use CIF coordinates
+            if input_pdb and input_pdb != 'NA' and os.path.isfile(input_pdb):
+                logging.debug(f"Assigning coordinates from input PDB: {input_pdb}")
+                mol_input = assign_coordinates_from_pdb(mol_input, input_pdb, dataset_name, "input")
+            else:
+                logging.debug(f"No input PDB available, using CIF coordinates for input molecule")
+                Chem.AssignStereochemistryFrom3D(mol_input)
+
+            # Process output molecule - use CIF topology + PDB coordinates
+            logging.debug(f"Loading output CIF: {output_cif}")
+            mol_output = load_mol_from_cif(output_cif)
+            logging.debug(f"Assigning coordinates from output PDB: {output_pdb}")
+            mol_output = assign_coordinates_from_pdb(mol_output, output_pdb, dataset_name, "output")
+
+            # Extract heavy atom count
+            heavy_atoms = get_heavy_atom_count(mol_output)
+            logging.info(f"Ligand contains {heavy_atoms} atoms")
+
+            # Find chiral centers
+            chiral_input = Chem.FindMolChiralCenters(mol_input, includeUnassigned=True)
+            chiral_output = Chem.FindMolChiralCenters(mol_output, includeUnassigned=True)
+
+            # Generate output SMILES
+            try:
+                mol_output_no_h = Chem.RemoveHs(mol_output)
+                smiles_output = Chem.MolToSmiles(mol_output_no_h, isomericSmiles=True)
+            except Exception as e:
+                logging.warning(f"Failed to generate output SMILES: {e}")
+                smiles_output = "Failed to generate"
+
+            # Compare chiral centers
+            differences = []
+            input_dict = {idx: config for idx, config in chiral_input}
+            output_dict = {idx: config for idx, config in chiral_output}
+            
+            all_chiral_indices = set(input_dict.keys()) | set(output_dict.keys())
+            
+            for idx in all_chiral_indices:
+                input_config = input_dict.get(idx, 'Not found')
+                output_config = output_dict.get(idx, 'Not found')
+                if input_config != output_config:
+                    differences.append(f"Atom {idx}: {input_config} -> {output_config}")
+
+            if differences:
+                result = f"Chiral centre inverted: {'; '.join(differences)} [CIF]"
+            else:
+                result = "Stereochemistry matches input [CIF]"
+                
+            logging.debug(f"CIF method - Input chiral centers: {chiral_input}")
+            logging.debug(f"CIF method - Output chiral centers: {chiral_output}")
+            
+            return result, smiles_output, heavy_atoms
         
-        return result, smiles_output
+        # ============ METHOD 2: SMILES TEMPLATE (FALLBACK) ============
+        else:
+            missing_cif = []
+            if not has_input_cif:
+                missing_cif.append("input CIF")
+            if not has_output_cif:
+                missing_cif.append("output CIF")
+            
+            logging.debug(f"CIF files missing ({', '.join(missing_cif)}), using SMILES template fallback for {dataset_name}")
+            
+            # Load input from SMILES
+            mol_input = Chem.MolFromSmiles(smiles)
+            if mol_input is None:
+                return f"[SMILES fallback] Failed to parse SMILES: {smiles}", "NA", 0
+            
+            # Read output structure from PDB
+            mol_output = Chem.MolFromPDBFile(output_pdb, removeHs=False)
+            if mol_output is None:
+                return f"[SMILES fallback] Failed to parse output PDB: {output_pdb}", "NA", 0
+            
+            # Extract only the ligand from output PDB
+            mol_output = _extract_ligand_from_pdb(mol_output)
+            
+            # Use SMILES as template to assign bond orders (PDB lacks this info)
+            try:
+                template_no_h = Chem.RemoveHs(mol_input)
+                output_no_h = Chem.RemoveHs(mol_output)
+                mol_output_corrected = AllChem.AssignBondOrdersFromTemplate(template_no_h, output_no_h)
+                
+                if mol_output_corrected is not None:
+                    mol_output = mol_output_corrected
+                    logging.debug("Successfully assigned bond orders using SMILES template")
+                else:
+                    logging.warning("Template assignment failed, using standard sanitization")
+                    Chem.SanitizeMol(mol_output)
+            except Exception as e:
+                logging.warning(f"Template approach failed: {e}, using standard sanitization")
+                try:
+                    Chem.SanitizeMol(mol_output)
+                except Exception as e2:
+                    logging.warning(f"Sanitization failed: {e2}")
+            
+            # Assign stereochemistry
+            Chem.AssignStereochemistry(mol_output, force=True, cleanIt=True)
+            
+            # Extract atom count
+            heavy_atoms = get_heavy_atom_count(mol_output)
+            logging.info(f"Ligand contains {heavy_atoms} atoms")
+            
+            # Generate output SMILES
+            try:
+                mol_output_no_h = Chem.RemoveHs(mol_output)
+                smiles_output = Chem.MolToSmiles(mol_output_no_h, isomericSmiles=True, canonical=True)
+            except Exception as e:
+                logging.warning(f"Failed to generate output SMILES: {e}")
+                smiles_output = "Failed to generate"
+            
+            # Find chiral centers
+            input_chiral_centers = _get_chiral_centers(mol_input)
+            output_chiral_centers = _get_chiral_centers(mol_output)
+            
+            # Align molecules and map chiral centers (needed because atom indices differ)
+            try:
+                mapped_output_chiral = _align_molecules_and_map_chiral_centers(
+                    mol_input, mol_output, input_chiral_centers, output_chiral_centers, "SMILES"
+                )
+                
+                input_dict = {idx: config for idx, config in input_chiral_centers}
+                output_dict = mapped_output_chiral
+                
+            except Exception as e:
+                return f"[SMILES fallback] Error during structural alignment: {e}", smiles_output, heavy_atoms
+            
+            # Compare chiral centers
+            differences = []
+            for atom_idx in input_dict:
+                if atom_idx in output_dict:
+                    if output_dict[atom_idx] is None:
+                        differences.append(f"Atom {atom_idx}: {input_dict[atom_idx]} -> missing")
+                    elif input_dict[atom_idx] != output_dict[atom_idx]:
+                        differences.append(f"Atom {atom_idx}: {input_dict[atom_idx]} -> {output_dict[atom_idx]}")
+                else:
+                    differences.append(f"Atom {atom_idx}: {input_dict[atom_idx]} -> missing")
+            
+            if differences:
+                result = f"Chiral centre inverted: {'; '.join(differences)} [SMILES fallback]"
+            else:
+                result = "Stereochemistry matches input [SMILES fallback]"
+            
+            logging.debug(f"SMILES fallback method - Input chiral centers: {len(input_chiral_centers)}")
+            logging.debug(f"SMILES fallback method - Output chiral centers: {len(output_chiral_centers)}")
+            
+            return result, smiles_output, heavy_atoms
         
     except FileNotFoundError as e:
-        logging.error(f"File not found in CIF/PDB chirality comparison: {e}")
-        return f"File not found: {e}", "NA"
+        logging.error(f"File not found in chirality comparison: {e}")
+        return f"File not found: {e}", "NA", 0
     except (IOError, OSError) as e:
-        logging.error(f"File I/O error in CIF/PDB chirality comparison: {e}")
-        return f"File error: {e}", "NA"
+        logging.error(f"File I/O error in chirality comparison: {e}")
+        return f"File error: {e}", "NA", 0
     except ValueError as e:
-        logging.error(f"Value error in CIF/PDB chirality comparison: {e}")
+        logging.error(f"Value error in chirality comparison: {e}")
         logging.debug(f"Full traceback: {traceback.format_exc()}")
-        return f"Structure error: {e}", "NA"
+        return f"Structure error: {e}", "NA", 0
     except Exception as e:
-        # Keep generic catch for truly unexpected errors
-        logging.error(f"Unexpected error in CIF/PDB chirality comparison: {e}")
+        logging.error(f"Unexpected error in chirality comparison: {e}")
         logging.debug(f"Full traceback: {traceback.format_exc()}")
-        return f"Error: {str(e)}", "NA"
+        return f"Error: {str(e)}", "NA", 0
 
 # Column order for consistent output across HTML and JSON
 COLUMN_ORDER = [
     'Export to XCE',
     'Comments',
     'Crystal Name',
+    'Ligand ID',
     'Compound Code',
-    'Input Ligand Structure',
-    'Ligand Density',
+    'Ligand Structure',
     'Chiral inversion',
-    'Pipedream Directory',
-    'Buster Report HTML',
+    'Ligand Density',
     'Ligand Report HTML',
+    'Composite Quality Score',
+    'Spider Plot',
+    'PCA Percentile Plot (Batch)',
+    'PCA Percentile Plot (PDB)',
     'Ligand CC',
-    'Ligand occupancy',
-    'Ligand avg B factor',
-    'Mean B factor',
-    'High resolution (A)',
+    'Ligand RSR',
+    'Ligand Fit Quality Score',
+    'Ligand Fit PCA Percentile (Batch)',
+    'Ligand Fit PCA Percentile (PDB)',
+    'Mogul Z Angle',
+    'Mogul Z Bond',
+    'Ligand Geometry Quality Score',
+    'Ligand Geometry PCA Percentile (Batch)',
+    'Ligand Geometry PCA Percentile (PDB)',
+    'Ligand Occupancy',
+    'Ligand Mean B Factor',
+    'Ligand Atoms',
+    'Ligand Clashes',
+    'Ligand Clashes per Atom',
+    'Buster Report HTML',
+    'High Resolution (Å)',
+    'Low Resolution (Å)',
     'R',
     'Rfree',
-    'Mogul Z angle',
-    'Mogul Z bond',
-    'c beta deviations',
-    'Rama outlier percent',
-    'Rama favored percent',
-    'Poor rotamer percent',
-    'Clash score',
-    'Mol probity score',
-    'RMS bonds',
-    'RMS angles',
-    'Pipedream Summary',
-    'PDB File',
-    'MTZ File',
-    '2Fo-Fc Map File',
-    'Fo-Fc Map File',
-    'Output SMILES'
+    'Mol Probity Score',
+    'Mean B Factor',
+    'Clash Score',
+    'Rama Favored Percent',
+    'Rama Outlier Percent',
+    'C-beta Deviations',
+    'Poor Rotamer Percent',
+    'RMS Bonds',
+    'RMS Angles',
+    'Pipedream Directory',
+    # 'Pipedream Summary',
+    # 'PDB File',
+    # 'MTZ File',
+    # '2Fo-Fc Map File',
+    # 'Fo-Fc Map File',
+    # 'Output SMILES'
 ]
+
+# Column tooltips for HTML table headers
+COLUMN_TOOLTIPS = {
+    'Crystal Name': 'Purple border indicates dataset contains multiple ligands',
+    'Compound Code': 'Green=best quality, yellow=middle, red=worst quality; purple border indicates duplicate compound.',
+    'Chiral inversion': 'Has stereochemistry changed from input SMILES?',
+    'Ligand CC': 'Green ≥0.95 (very good), Light green ≥0.90 (good), Yellow ≥0.80 (OK), Red <0.80 (poor)',
+    'Ligand RSR': 'Green <0.2 (very good), Light green <0.3 (good), Yellow <0.4 (OK), Red ≥0.4 (poor)',
+    'Ligand Fit Quality Score': 'Combined score (0-100) from Ligand CC and RSR using piecewise linear conversion. CC scale emphasizes high quality (flat 100 for CC≥0.95, steep slope 0.90-0.95). RSR scale inverted (lower is better) with progressive penalties. Average of both component scores. Green ≥75 (excellent), Yellow ≥50 (good/OK), Red <50 (poor)',
+    'Ligand Geometry Quality Score': 'Combined score (0-100) from Mogul Z-scores (bonds and angles) using piecewise linear conversion. Both Z-scores converted with thresholds: <1.5 (good, 80-100 pts), 1.5-2.5 (OK, 50-80 pts), 2.5-4.0 (poor, 20-50 pts), >4.0 (bad, 0-20 pts). Average of both component scores. Green ≥75 (excellent), Yellow ≥50 (good/OK), Red <50 (poor)',
+    'Composite Quality Score': 'Weighted average (60% Fit, 40% Geometry) with penalties for high B-factor ratio (>1.2) and ligand clashes (≥1). Green ≥75 (excellent), Yellow ≥50 (good/OK), Red <50 (poor)',
+    'Ligand Fit PCA Percentile (Batch)': 'Percentile rank (0-100%) within this batch based on PCA of Ligand CC and RSR. Score represents percentage of batch with worse fit quality. Uses z-score normalization and PC1 projection, then rank-based percentile calculation. 100% = best fit in batch, 0% = worst fit. Green ≥75%, Yellow ≥50%, Red <50%',
+    'Ligand Fit PCA Percentile (PDB)': 'Percentile rank (0-100%) vs PDB based on PCA of Ligand CC and RSR. Score represents percentage of all PDB structures with worse fit quality. Uses 2020 PDB statistics (mean/std) for z-score normalization and PC1 projection. 100% = better than all PDB, 0% = worse than all PDB. Green ≥75%, Yellow ≥50%, Red <50%',
+    'Ligand Geometry PCA Percentile (Batch)': 'Percentile rank (0-100%) within this batch based on PCA of Mogul Z-scores. Score represents percentage of batch with worse geometry. Uses z-score normalization and PC1 projection, then rank-based percentile calculation. 100% = best geometry in batch, 0% = worst. Green ≥75%, Yellow ≥50%, Red <50%',
+    'Ligand Geometry PCA Percentile (PDB)': 'Percentile rank (0-100%) vs PDB based on PCA of Mogul Z-scores. Score represents percentage of all PDB structures with worse geometry. Uses 2020 PDB statistics for z-score normalization and PC1 projection. 100% = better than all PDB, 0% = worse than all PDB. Green ≥75%, Yellow ≥50%, Red <50%',
+    'PCA Percentile Plot (Batch)': 'Interactive 2D scatter plot showing dataset position within this batch. X-axis: Ligand Fit PCA Percentile (Batch), Y-axis: Ligand Geometry PCA Percentile (Batch). Colored quadrants indicate relative quality within batch: green (excellent), yellow (mixed), red (poor). Reference lines at 50% and 75%. Click to view interactive plot with hover details',
+    'PCA Percentile Plot (PDB)': 'Interactive 2D scatter plot showing dataset position vs PDB. X-axis: Ligand Fit PCA Percentile (PDB), Y-axis: Ligand Geometry PCA Percentile (PDB). Colored quadrants indicate quality regions: green (excellent), yellow (mixed), red (poor). Reference lines at 50% and 75%. Click to view interactive plot with hover details comparing to PDB structures',
+    'Spider Plot': 'Interactive radar/spider plot showing 6 key quality metrics on a 0-100 scale: Ligand CC (higher better), Ligand Fit/RSR (inverted, lower better), Mogul Z Angle (inverted), Mogul Z Bond (inverted), Ligand Clashes (inverted), B-factor Ratio (closer to 1.0 better). All metrics normalized to 0-100 where 100=best quality. Click to view interactive plot with hover details for each metric',
+    'Mogul Z Angle': 'Green <1.5 (good), Yellow 1.5-2.5 (OK), Light purple 2.5-4 (poor), Purple >4 (bad)',
+    'Mogul Z Bond': 'Green <1.5 (good), Yellow 1.5-2.5 (OK), Light purple 2.5-4 (poor), Purple >4 (bad)',
+    'Ligand Mean B Factor': f'Red indicates ligand B-factor ratio ≥{THRESHOLDS.b_factor_ratio} times mean B-factor',
+    'Ligand Clashes': 'Number of ligand clashes (>0.4 Å overlap) from MolProbity',
+    'Ligand Clashes per Atom': 'Ligand clashes normalized by total ligand atom count',
+    'R': f'Red indicates R-factor >{THRESHOLDS.r_max}',
+    'Rfree': f'Red indicates R-free >{THRESHOLDS.rfree_max}',
+    'Rama Favored Percent': 'Green ≥98% (excellent Ramachandran geometry)',
+    'Rama Outlier Percent': f'Red indicates Ramachandran outliers >{THRESHOLDS.rama_outlier_max}%',
+    'Poor Rotamer Percent': f'Red indicates poor rotamers >{THRESHOLDS.poor_rotamer_max}%',
+    'Clash Score': f'Red indicates clash score >{THRESHOLDS.clash_score_max}',
+    'Mol Probity Score': f'Red indicates MolProbity score >{THRESHOLDS.molprobity_score_max}',
+    'RMS Angles': f'Red indicates RMS angles >{THRESHOLDS.rms_angles_max}°',
+    'RMS Bonds': f'Red indicates RMS bonds >{THRESHOLDS.rms_bonds_max} Å',
+}
+
+
+def calculate_quality_scores(ligand_cc: Any, ligand_rsr: Any, 
+                            mogul_z_bond: Any, mogul_z_angle: Any,
+                            ligand_mean_b: Any = None, global_mean_b: Any = None,
+                            ligand_clashes: Any = None) -> Dict[str, Any]:
+    """
+    Calculate fit quality, geometry quality, and composite quality scores.
+    
+    Args:
+        ligand_cc: Ligand correlation coefficient
+        ligand_rsr: Ligand real space R-factor
+        mogul_z_bond: Mogul Z score for bonds
+        mogul_z_angle: Mogul Z score for angles
+        ligand_mean_b: Mean ligand B-factor (optional, for composite score)
+        global_mean_b: Global mean B-factor (optional, for composite score)
+        ligand_clashes: Number of ligand clashes (optional, for composite score)
+        
+    Returns:
+        Dictionary with 'Ligand Fit Quality Score', 'Ligand Geometry Quality Score', 'Composite Quality Score'
+    """
+    # Convert to numeric, handling 'NA' values
+    try:
+        cc = float(ligand_cc) if ligand_cc not in ['NA', None] else None
+    except (ValueError, TypeError):
+        cc = None
+    
+    try:
+        rsr = float(ligand_rsr) if ligand_rsr not in ['NA', None] else None
+    except (ValueError, TypeError):
+        rsr = None
+    
+    try:
+        z_bond = float(mogul_z_bond) if mogul_z_bond not in ['NA', None] else None
+    except (ValueError, TypeError):
+        z_bond = None
+    
+    try:
+        z_angle = float(mogul_z_angle) if mogul_z_angle not in ['NA', None] else None
+    except (ValueError, TypeError):
+        z_angle = None
+    
+    # Calculate CC score
+    def score_ligand_cc(cc_val):
+        if cc_val >= 0.95:
+            return 100
+        elif cc_val >= 0.90:
+            return 90 + ((cc_val - 0.90) / 0.05) * 10
+        elif cc_val >= 0.80:
+            return 50 + ((cc_val - 0.80) / 0.10) * 40
+        else:
+            return max(((cc_val - 0.60) / 0.20) * 50, 0)
+    
+    # Calculate RSR score
+    def score_rsr(rsr_val):
+        if rsr_val < 0.2:
+            return 100 - (rsr_val / 0.2) * 10
+        elif rsr_val < 0.3:
+            return 90 - ((rsr_val - 0.2) / 0.1) * 20
+        elif rsr_val < 0.4:
+            return 70 - ((rsr_val - 0.3) / 0.1) * 30
+        else:
+            return max(40 - ((rsr_val - 0.4) / 0.2) * 40, 0)
+    
+    # Calculate Mogul Z score
+    def score_mogul_z(z_val):
+        if z_val < THRESHOLDS.mogul_z_good:
+            return 100 - (z_val / THRESHOLDS.mogul_z_good) * 20
+        elif z_val < THRESHOLDS.mogul_z_ok:
+            return 80 - ((z_val - THRESHOLDS.mogul_z_good) / 
+                          (THRESHOLDS.mogul_z_ok - THRESHOLDS.mogul_z_good) * 30)
+        elif z_val < THRESHOLDS.mogul_z_poor:
+            return 50 - ((z_val - THRESHOLDS.mogul_z_ok) / 
+                         (THRESHOLDS.mogul_z_poor - THRESHOLDS.mogul_z_ok) * 30)
+        else:
+            return max(20 - ((z_val - THRESHOLDS.mogul_z_poor) / 2.0 * 20), 0)
+    
+    # Calculate component scores
+    cc_score = score_ligand_cc(cc) if cc is not None else None
+    rsr_score = score_rsr(rsr) if rsr is not None else None
+    bond_score = score_mogul_z(z_bond) if z_bond is not None else None
+    angle_score = score_mogul_z(z_angle) if z_angle is not None else None
+    
+    # Calculate fit quality (average of CC and RSR scores)
+    if cc_score is not None and rsr_score is not None:
+        fit_quality = (cc_score + rsr_score) / 2
+    elif cc_score is not None:
+        fit_quality = cc_score
+    elif rsr_score is not None:
+        fit_quality = rsr_score
+    else:
+        fit_quality = 'NA'
+    
+    # Calculate geometry quality (average of bond and angle scores)
+    if bond_score is not None and angle_score is not None:
+        geometry_quality = (bond_score + angle_score) / 2
+    elif bond_score is not None:
+        geometry_quality = bond_score
+    elif angle_score is not None:
+        geometry_quality = angle_score
+    else:
+        geometry_quality = 'NA'
+    
+    # Calculate base overall quality (weighted average: 60% fit, 40% geometry)
+    if fit_quality != 'NA' and geometry_quality != 'NA':
+        base_quality = (fit_quality * 0.6) + (geometry_quality * 0.4)
+    elif fit_quality != 'NA':
+        base_quality = fit_quality
+    elif geometry_quality != 'NA':
+        base_quality = geometry_quality
+    else:
+        base_quality = 'NA'
+    
+    # Calculate composite quality score with contextual penalties
+    composite_quality = base_quality
+    if composite_quality != 'NA':
+        total_penalty = 0
+        
+        # B-factor ratio penalty (max 10)
+        try:
+            ligand_b = float(ligand_mean_b) if ligand_mean_b not in ['NA', None] else None
+            global_b = float(global_mean_b) if global_mean_b not in ['NA', None] else None
+            
+            if ligand_b is not None and global_b is not None and global_b > 0:
+                b_factor_ratio = ligand_b / global_b
+                if b_factor_ratio > 1.5:
+                    total_penalty += 10  # Bad - likely poorly ordered or artifactual
+                elif b_factor_ratio > 1.2:
+                    total_penalty += 5  # Caution - ligand more mobile
+                # else: ratio <= 1.2, no penalty (OK or perfect)
+        except (ValueError, TypeError):
+            pass  # Skip penalty if values invalid
+        
+        # Ligand clashes penalty (max 10)
+        try:
+            clashes = int(ligand_clashes) if ligand_clashes not in ['NA', None] else None
+            
+            if clashes is not None and clashes >= 0:
+                if clashes > 3:
+                    total_penalty += 10  # Bad - serious stereochemical problem
+                elif clashes >= 1:
+                    total_penalty += 5  # Caution - some clashes present
+                # else: clashes == 0, no penalty (good)
+        except (ValueError, TypeError):
+            pass  # Skip penalty if value invalid
+        
+        # Apply penalties (max combined penalty of 40)
+        composite_quality = max(composite_quality - total_penalty, 0)
+    
+    return {
+        'Ligand Fit Quality Score': safe_round(fit_quality, 1) if fit_quality != 'NA' else 'NA',
+        'Ligand Geometry Quality Score': safe_round(geometry_quality, 1) if geometry_quality != 'NA' else 'NA',
+        'Composite Quality Score': safe_round(composite_quality, 1) if composite_quality != 'NA' else 'NA'
+    }
+
+
+def calculate_pca_scores_batch(results: List[Dict[str, Any]], pca_ref: Optional[PCAReference] = None) -> List[Dict[str, Any]]:
+    """
+    Calculate PCA-based scores for fit and geometry quality relative to the current batch.
+    This shows where each dataset sits within the group being analyzed.
+    
+    Args:
+        results: List of result dictionaries with quality metrics
+        pca_ref: Optional PCAReference object with PDB archive parameters for consistent PC1 calculation
+        
+    Returns:
+        Updated results list with added PCA score columns
+    """
+    import numpy as np
+    from math import sqrt
+    
+    # Extract fit metrics (Ligand CC and RSR)
+    fit_data = []
+    fit_indices = []
+    for i, result in enumerate(results):
+        cc = result.get('Ligand CC', 'NA')
+        rsr = result.get('Ligand RSR', 'NA')
+        try:
+            cc_val = float(cc) if cc not in ['NA', None] else None
+            rsr_val = float(rsr) if rsr not in ['NA', None] else None
+            if cc_val is not None and rsr_val is not None:
+                fit_data.append([rsr_val, cc_val])  # Note: [RSR, CC] order
+                fit_indices.append(i)
+        except (ValueError, TypeError):
+            pass
+    
+    # Calculate fit PCA scores if we have enough data
+    if len(fit_data) >= 2:
+        fit_array = np.array(fit_data)
+        
+        # Use PDB parameters if available for consistent PC1 calculation
+        # This ensures batch and PDB rankings have the same relative order
+        if pca_ref is not None and pca_ref.loaded:
+            mean_rsr = pca_ref.d_par["rsr"]["mean"]
+            std_rsr = pca_ref.d_par["rsr"]["std"]
+            loading_rsr = pca_ref.d_par["rsr"]["loading"]
+            mean_cc = pca_ref.d_par["rscc"]["mean"]
+            std_cc = pca_ref.d_par["rscc"]["std"]
+            loading_cc = pca_ref.d_par["rscc"]["loading"]
+        else:
+            # Fallback to batch statistics if PDB ref not available
+            mean_rsr = np.mean(fit_array[:, 0])
+            std_rsr = np.std(fit_array[:, 0], ddof=1) if len(fit_array) > 1 else 1.0
+            mean_cc = np.mean(fit_array[:, 1])
+            std_cc = np.std(fit_array[:, 1], ddof=1) if len(fit_array) > 1 else 1.0
+            
+            # Avoid division by zero
+            if std_rsr == 0:
+                std_rsr = 1.0
+            if std_cc == 0:
+                std_cc = 1.0
+            
+            # PCA loadings (equal magnitude, opposite signs)
+            loading_rsr = sqrt(2) / 2.0
+            loading_cc = -sqrt(2) / 2.0
+        
+        # Calculate PC1 for each dataset using consistent parameters
+        pc1_values = []
+        for idx, data_idx in enumerate(fit_indices):
+            rsr = fit_array[idx, 0]
+            cc = fit_array[idx, 1]
+            
+            # Z-score normalization and PCA projection
+            fit_pc1 = ((rsr - mean_rsr) / std_rsr) * loading_rsr + \
+                     ((cc - mean_cc) / std_cc) * loading_cc
+            
+            pc1_values.append((data_idx, fit_pc1))
+        
+        # Calculate percentile ranking within batch
+        # Lower PC1 = better quality (low RSR, high CC)
+        if len(pc1_values) > 0:
+            # Extract all PC1 values from the batch
+            all_pc1_list = [pc1 for _, pc1 in pc1_values]
+            
+            for data_idx, fit_pc1 in pc1_values:
+                # Sort all PC1 values in the batch
+                sorted_list = sorted(all_pc1_list)
+                
+                # Count how many values are STRICTLY less than this one
+                rank = sum(1 for x in sorted_list if x < fit_pc1)
+                
+                # Calculate percentile (0-1 range)
+                if len(all_pc1_list) > 1:
+                    percentile = rank / float(len(all_pc1_list) - 1)
+                else:
+                    percentile = 0.5  # Single structure gets middle score
+                
+                # Invert so lowest PC1 (best quality) gets highest percentile
+                fit_pca_score = (1 - percentile) * 100
+                results[data_idx]['Ligand Fit PCA Percentile (Batch)'] = round(fit_pca_score, 1)
+    
+    # Extract geometry metrics (Mogul Z scores)
+    geom_data = []
+    geom_indices = []
+    for i, result in enumerate(results):
+        z_bond = result.get('Mogul Z Bond', 'NA')
+        z_angle = result.get('Mogul Z Angle', 'NA')
+        try:
+            bond_val = float(z_bond) if z_bond not in ['NA', None] else None
+            angle_val = float(z_angle) if z_angle not in ['NA', None] else None
+            if bond_val is not None and angle_val is not None:
+                geom_data.append([bond_val, angle_val])
+                geom_indices.append(i)
+        except (ValueError, TypeError):
+            pass
+    
+    # Calculate geometry PCA scores if we have enough data
+    if len(geom_data) >= 2:
+        geom_array = np.array(geom_data)
+        
+        # Use PDB parameters if available for consistent PC1 calculation
+        # This ensures batch and PDB rankings have the same relative order
+        if pca_ref is not None and pca_ref.loaded:
+            mean_z_bond = pca_ref.d_par["mogul_bonds_rmsz"]["mean"]
+            std_z_bond = pca_ref.d_par["mogul_bonds_rmsz"]["std"]
+            loading_z_bond = pca_ref.d_par["mogul_bonds_rmsz"]["loading"]
+            mean_z_angle = pca_ref.d_par["mogul_angles_rmsz"]["mean"]
+            std_z_angle = pca_ref.d_par["mogul_angles_rmsz"]["std"]
+            loading_z_angle = pca_ref.d_par["mogul_angles_rmsz"]["loading"]
+        else:
+            # Fallback to batch statistics if PDB ref not available
+            mean_z_bond = np.mean(geom_array[:, 0])
+            std_z_bond = np.std(geom_array[:, 0], ddof=1) if len(geom_array) > 1 else 1.0
+            mean_z_angle = np.mean(geom_array[:, 1])
+            std_z_angle = np.std(geom_array[:, 1], ddof=1) if len(geom_array) > 1 else 1.0
+            
+            # Avoid division by zero
+            if std_z_bond == 0:
+                std_z_bond = 1.0
+            if std_z_angle == 0:
+                std_z_angle = 1.0
+            
+            # PCA loadings (both positive for Mogul Z scores - higher is worse)
+            loading_z_bond = sqrt(2) / 2.0
+            loading_z_angle = sqrt(2) / 2.0
+        
+        # Calculate PC1 for each dataset using consistent parameters
+        pc1_values = []
+        for idx, data_idx in enumerate(geom_indices):
+            z_bond = geom_array[idx, 0]
+            z_angle = geom_array[idx, 1]
+            
+            # Z-score normalization and PCA projection
+            geom_pc1 = ((z_bond - mean_z_bond) / std_z_bond) * loading_z_bond + \
+                      ((z_angle - mean_z_angle) / std_z_angle) * loading_z_angle
+            
+            pc1_values.append((data_idx, geom_pc1))
+        
+        # Calculate percentile ranking within batch
+        # Lower PC1 = better geometry (lower Mogul Z scores)
+        if len(pc1_values) > 0:
+            # Extract all PC1 values from the batch
+            all_pc1_list = [pc1 for _, pc1 in pc1_values]
+            
+            for data_idx, geom_pc1 in pc1_values:
+                # Sort all PC1 values in the batch
+                sorted_list = sorted(all_pc1_list)
+                
+                # Count how many values are STRICTLY less than this one
+                rank = sum(1 for x in sorted_list if x < geom_pc1)
+                
+                # Calculate percentile (0-1 range)
+                if len(all_pc1_list) > 1:
+                    percentile = rank / float(len(all_pc1_list) - 1)
+                else:
+                    percentile = 0.5  # Single structure gets middle score
+                
+                # Invert so lowest PC1 (best quality) gets highest percentile
+                geom_pca_score = (1 - percentile) * 100
+                results[data_idx]['Ligand Geometry PCA Percentile (Batch)'] = round(geom_pca_score, 1)
+    
+    return results
+
+
+def calculate_pca_scores_pdb(results: List[Dict[str, Any]], pca_ref: Optional[PCAReference] = None) -> List[Dict[str, Any]]:
+    """
+    Calculate PCA-based scores relative to the entire PDB archive.
+    This shows where each dataset sits compared to all known structures.
+    
+    Args:
+        results: List of result dictionaries with quality metrics
+        pca_ref: PCAReference object with loaded PDB archive data
+        
+    Returns:
+        Updated results list with added PCA score columns
+    """
+    if pca_ref is None or not pca_ref.loaded:
+        logging.debug("PDB PCA reference not available, skipping PDB archive scores")
+        # Set all PDB scores to 'NA'
+        for result in results:
+            result['Ligand Fit PCA Percentile (PDB)'] = 'NA'
+            result['Ligand Geometry PCA Percentile (PDB)'] = 'NA'
+        return results
+    
+    logging.info(f"Calculating PDB archive percentile scores for {len(results)} structures")
+    
+    # Calculate fit scores against PDB archive
+    for result in results:
+        ligand_cc = result.get('Ligand CC', 'NA')
+        ligand_rsr = result.get('Ligand RSR', 'NA')
+        
+        try:
+            cc_val = float(ligand_cc) if ligand_cc not in ['NA', None] else None
+            rsr_val = float(ligand_rsr) if ligand_rsr not in ['NA', None] else None
+            
+            if cc_val is not None and rsr_val is not None:
+                fit_score = pca_ref.calculate_fit_score(cc_val, rsr_val)
+                result['Ligand Fit PCA Percentile (PDB)'] = round(fit_score, 1) if fit_score is not None else 'NA'
+            else:
+                result['Ligand Fit PCA Percentile (PDB)'] = 'NA'
+        except (ValueError, TypeError):
+            result['Ligand Fit PCA Percentile (PDB)'] = 'NA'
+    
+    # Calculate geometry scores against PDB archive
+    for result in results:
+        mogul_z_bond = result.get('Mogul Z Bond', 'NA')
+        mogul_z_angle = result.get('Mogul Z Angle', 'NA')
+        
+        try:
+            bond_val = float(mogul_z_bond) if mogul_z_bond not in ['NA', None] else None
+            angle_val = float(mogul_z_angle) if mogul_z_angle not in ['NA', None] else None
+            
+            if bond_val is not None and angle_val is not None:
+                geom_score = pca_ref.calculate_geometry_score(bond_val, angle_val)
+                result['Ligand Geometry PCA Percentile (PDB)'] = round(geom_score, 1) if geom_score is not None else 'NA'
+            else:
+                result['Ligand Geometry PCA Percentile (PDB)'] = 'NA'
+        except (ValueError, TypeError):
+            result['Ligand Geometry PCA Percentile (PDB)'] = 'NA'
+    
+    return results
+
 
 def _extract_ligand_from_pdb(mol: Chem.Mol) -> Chem.Mol:
     """Extract ligand fragment from a PDB molecule that may contain protein + ligand."""
@@ -408,6 +1151,26 @@ def _extract_ligand_from_pdb(mol: Chem.Mol) -> Chem.Mol:
         logging.warning(f"Error extracting ligand from PDB, using full structure: {e}")
     
     return mol
+
+
+def get_heavy_atom_count(mol: Chem.Mol) -> int:
+    """
+    Get the total number of atoms in a molecule.
+    
+    Args:
+        mol: RDKit molecule object
+        
+    Returns:
+        Total number of atoms (including hydrogens), or 0 if molecule is invalid
+    """
+    if mol is None:
+        return 0
+    
+    try:
+        return mol.GetNumAtoms()
+    except (ValueError, RuntimeError, AttributeError) as e:
+        logging.warning(f"Error counting atoms: {e}")
+        return 0
 
 def _save_smiles_file(pipedream_dir: str, compound_code: str, 
                      chirality_flip: str, updated_smiles: str, 
@@ -457,6 +1220,12 @@ def save_output_smiles_with_analysis(output_mol, compound_code, pipedream_dir, c
         
         # Create output path using helper function
         output_path = get_output_smiles_path(pipedream_dir, compound_code)
+        
+        # Check write permissions before attempting
+        output_dir = os.path.dirname(output_path)
+        if not os.access(output_dir, os.W_OK):
+            logging.error(f"No write permission for directory: {output_dir}")
+            return f"Error: No write permission"
             
         # Write file with comprehensive metadata
         with open(output_path, "w", encoding="utf-8") as f:
@@ -478,211 +1247,6 @@ def save_output_smiles_with_analysis(output_mol, compound_code, pipedream_dir, c
     except (IOError, OSError, PermissionError) as e:
         logging.error(f"File I/O error saving output SMILES for {compound_code}: {e}")
         return f"Error: Cannot write file - {e}"
-
-def detect_chiral_inversion(input_smi_path: str, output_pdb_path: str, input_pdb_path: Optional[str] = None, pipedream_dir: str = 'NA', compound_code: str = 'NA') -> Tuple[str, str]:
-    """
-    Detect chirality differences between input and output structures.
-    Uses input SMILES (or optionally input PDB) and output PDB files.
-    
-    Args:
-        input_smi_path: Path to input SMILES file
-        output_pdb_path: Path to output PDB file
-        input_pdb_path: Optional path to input PDB file (preferred over SMILES)
-        pipedream_dir: Pipedream directory path for saving canonical SMILES output files
-        compound_code: Compound code used for naming output SMILES files
-    
-    Returns:
-        Tuple of (chirality comparison result, updated SMILES from output structure)
-    """
-    # File existence checks
-    if not os.path.isfile(input_smi_path):
-        return f"Input SMILES not found: {input_smi_path}", "NA"
-    if not os.path.isfile(output_pdb_path):
-        return f"Output PDB not found: {output_pdb_path}", "NA"
-
-    try:
-        # Try to use input PDB if available, otherwise fall back to SMILES
-        if input_pdb_path and os.path.isfile(input_pdb_path):
-            logging.debug(f"Using input PDB for comparison: {input_pdb_path}")
-            input_mol = Chem.MolFromPDBFile(input_pdb_path, removeHs=False)
-            if input_mol is None:
-                logging.warning(f"Failed to parse input PDB, falling back to SMILES")
-                input_mol = None
-            else:
-                Chem.AssignStereochemistry(input_mol, force=True, cleanIt=True)
-                source = "PDB"
-        
-        # Fall back to SMILES if PDB not available or failed
-        if input_mol is None:
-            logging.debug(f"Using input SMILES for comparison: {input_smi_path}")
-            with open(input_smi_path, 'r', encoding='utf-8') as f:
-                smiles_line = f.readline().strip()
-            smiles = smiles_line.split()[0] if smiles_line else ""
-            if not smiles:
-                return f"Empty or invalid SMILES file: {input_smi_path}", "NA"
-
-            logging.debug(f"Processing SMILES: {smiles}")
-            input_mol = Chem.MolFromSmiles(smiles)
-            if input_mol is None:
-                return f"Failed to parse SMILES: {smiles}", "NA"
-            source = "SMILES"
-
-        # Read output structure from PDB file
-        logging.debug(f"Reading output structure from PDB file: {output_pdb_path}")
-        output_mol = Chem.MolFromPDBFile(output_pdb_path, removeHs=False)
-        if output_mol is None:
-            return f"Failed to parse output PDB file: {output_pdb_path}", "NA"
-
-        # Extract only the ligand from the output PDB
-        output_mol = _extract_ligand_from_pdb(output_mol)
-        
-        # CRITICAL: Use input SMILES as template to preserve bond orders
-        # PDB files lack bond order information, so we use the input structure as a template
-        template_mol = None
-        try:
-            # Get the input SMILES string to use as template
-            if source == "SMILES":
-                # We already have the input molecule from SMILES
-                template_mol = input_mol
-                logging.debug("Using input SMILES molecule as template for bond order assignment")
-            else:
-                # If input was from PDB, try to get SMILES from the original SMILES file
-                logging.debug(f"Reading SMILES template from: {input_smi_path}")
-                with open(input_smi_path, 'r', encoding='utf-8') as f:
-                    smiles_line = f.readline().strip()
-                template_smiles = smiles_line.split()[0] if smiles_line else ""
-                if template_smiles:
-                    template_mol = Chem.MolFromSmiles(template_smiles)
-                    logging.debug(f"Using SMILES template: {template_smiles}")
-                
-            if template_mol is not None:
-                # Use template to assign correct bond orders to output molecule
-                
-                # Remove hydrogens from both molecules for template matching
-                template_no_h = Chem.RemoveHs(template_mol)
-                output_no_h = Chem.RemoveHs(output_mol)
-                
-                # Assign bond orders from template - this preserves the correct connectivity
-                output_mol_corrected = AllChem.AssignBondOrdersFromTemplate(template_no_h, output_no_h)
-                
-                if output_mol_corrected is not None:
-                    output_mol = output_mol_corrected
-                    logging.debug("Successfully assigned bond orders using input SMILES template")
-                else:
-                    logging.warning("Failed to assign bond orders from template, using standard sanitization")
-                    raise Exception("Template assignment failed")
-            else:
-                raise Exception("No template molecule available")
-                
-        except Exception as e:
-            logging.warning(f"Could not use template for bond order assignment: {e}, falling back to standard sanitization")
-            # Fallback to standard sanitization if template approach fails
-            try:
-                Chem.SanitizeMol(output_mol)
-            except Exception as e2:
-                logging.warning(f"Standard sanitization failed: {e2}, trying alternative approach")
-                try:
-                    output_mol = Chem.AddHs(output_mol)
-                    Chem.SanitizeMol(output_mol)
-                    output_mol = Chem.RemoveHs(output_mol)
-                except Exception as e3:
-                    logging.warning(f"Alternative sanitization also failed: {e3}")
-        
-        # Now assign stereochemistry with correct bond orders
-        Chem.AssignStereochemistry(output_mol, force=True, cleanIt=True)
-        
-        # Generate SMILES from output ligand (exclude hydrogens)
-        output_mol_no_h = Chem.RemoveHs(output_mol)
-        
-        # Get input SMILES for comparison metadata
-        input_smiles_for_metadata = ""
-        if source == "SMILES":
-            input_smiles_for_metadata = smiles
-        else:
-            # Try to read from SMILES file for metadata
-            try:
-                with open(input_smi_path, 'r', encoding='utf-8') as f:
-                    input_smiles_for_metadata = f.readline().strip().split()[0]
-            except (IOError, IndexError, OSError):
-                pass
-        
-        updated_smiles = Chem.MolToSmiles(output_mol_no_h, isomericSmiles=True, canonical=True)
-        if not updated_smiles:
-            updated_smiles = "Failed to generate SMILES"
-
-        # Find chiral centers
-        input_chiral_centers = _get_chiral_centers(input_mol)
-        output_chiral_centers = _get_chiral_centers(output_mol)
-        
-        logging.debug(f"Input chiral centers: {len(input_chiral_centers)}")
-        logging.debug(f"Output chiral centers: {len(output_chiral_centers)}")
-
-        # Additional molecular information
-        input_atoms = input_mol.GetNumAtoms()
-        output_atoms = output_mol.GetNumAtoms();
-        
-        logging.debug(f"Input ligand ({source}): {input_atoms} atoms")
-        logging.debug(f"Output ligand (PDB): {output_atoms} atoms")
-        
-        # For both PDB and SMILES inputs, we need to handle atom mapping since 
-        # atom indices don't correspond between input and output structures        
-        try:
-            # Align molecules and map chiral centers
-            mapped_output_chiral = _align_molecules_and_map_chiral_centers(
-                input_mol, output_mol, input_chiral_centers, output_chiral_centers, source
-            )
-            
-            # Compare mapped chirality
-            input_dict = {idx: config for idx, config in input_chiral_centers}
-            output_dict = mapped_output_chiral;
-                
-        except Exception as e:
-            return f"Error during structural alignment: {e}", updated_smiles
-
-        # Check for differences in chiral centers
-        differences = []
-        for atom_idx in input_dict:
-            if atom_idx in output_dict:
-                if output_dict[atom_idx] is None:
-                    differences.append(f"Atom {atom_idx}: {input_dict[atom_idx]} -> missing")
-                elif input_dict[atom_idx] != output_dict[atom_idx]:
-                    differences.append(f"Atom {atom_idx}: {input_dict[atom_idx]} -> {output_dict[atom_idx]}")
-            else:
-                differences.append(f"Atom {atom_idx}: {input_dict[atom_idx]} -> missing")
-
-        if differences:
-            result = "Chiral centre inverted: " + "; ".join(differences)
-            logging.debug(f"Chirality comparison complete: {result}")
-            logging.debug(f"Input source: {source}, Output source: PDB")
-        else:
-            result = "Stereochemistry matches input"
-            logging.debug(f"Chirality comparison complete: {result}")
-            logging.debug(f"Input source: {source}, Output source: PDB")
-            # If no differences, don't provide updated SMILES
-            updated_smiles = "NA"
-        
-        # Save comprehensive SMILES analysis file
-        smiles_file_path = "NA"
-        if pipedream_dir != 'NA' and compound_code != 'NA':
-            smiles_file_path = save_output_smiles_with_analysis(
-                output_mol, compound_code, pipedream_dir, result, input_smiles_for_metadata
-            )
-            if not smiles_file_path.startswith("Error"):
-                logging.debug(f"Output SMILES analysis saved to: {smiles_file_path}")
-        
-        return result, updated_smiles
-
-    except (IOError, OSError) as e:
-        logging.error(f"File I/O error during chirality comparison for {input_smi_path} -> {output_pdb_path}: {e}")
-        return f"File error: {e}", "NA"
-    except (ValueError, RuntimeError) as e:
-        logging.error(f"RDKit error during chirality comparison for {input_smi_path} -> {output_pdb_path}: {e}")
-        return f"Structure error: {e}", "NA"
-    except Exception as e:
-        # Keep a generic catch for truly unexpected errors, but log them prominently
-        logging.error(f"Unexpected error during chirality comparison for {input_smi_path} -> {output_pdb_path}: {e}")
-        logging.error(f"Traceback: {traceback.format_exc()}")
-        return f"Unexpected error: {e}", "NA"
 
 
 def _get_chiral_centers(mol: Chem.Mol) -> List[Tuple[int, str]]:
@@ -731,13 +1295,18 @@ def _align_molecules_and_map_chiral_centers(input_mol: Chem.Mol, output_mol: Che
     Returns:
         Dictionary mapping input atom indices to output configurations
     """
-    from rdkit.Chem import rdFMCS
+    try:
+        from rdkit.Chem import rdFMCS
+    except ImportError as e:
+        raise ImportError(f"Failed to import rdFMCS: {e}")
     
-    # Find maximum common substructure to establish atom mapping
-    mcs = rdFMCS.FindMCS([input_mol, output_mol], 
-                       bondCompare=rdFMCS.BondCompare.CompareOrderExact,
-                       atomCompare=rdFMCS.AtomCompare.CompareElements,
-                       timeout=PROCESSING.mcs_timeout_seconds)
+    try:
+        mcs = rdFMCS.FindMCS([input_mol, output_mol], 
+                           bondCompare=rdFMCS.BondCompare.CompareOrderExact,
+                           atomCompare=rdFMCS.AtomCompare.CompareElements,
+                           timeout=PROCESSING.mcs_timeout_seconds)
+    except RuntimeError as e:
+        raise ValueError(f"MCS calculation failed or timed out: {e}")
     
     if mcs.numAtoms <= PROCESSING.min_mcs_atoms:
         raise ValueError(f"Insufficient structural similarity for mapping (MCS: {mcs.numAtoms} atoms)")
@@ -846,10 +1415,13 @@ def safe_get(d: Any, keys: List[Any], default: Any = "NA") -> Any:
     return d if d != {} else default
 
 
-def safe_round(value: Any, digits: int = 3) -> Any:
+def safe_round(value: Any, digits: int = 3) -> Union[float, str]:
     """Round a value to a given number of digits, or return 'NA' if not possible."""
     try:
-        return round(float(value), digits)
+        num_val = float(value)
+        if pd.isna(num_val):
+            return 'NA'
+        return round(num_val, digits)
     except (TypeError, ValueError):
         return 'NA'
 
@@ -866,7 +1438,11 @@ def get_file_link_html(cell_val: str) -> str:
     
     file_ext = os.path.splitext(cell_val)[1].lower()
     file_name = os.path.basename(cell_val)
-    return f'<td><a href="#" class="file-link" data-file="file://{cell_val}" data-ext="{file_ext}">{file_name}</a></td>'
+    
+    # Return button styled consistently with percentile plot buttons (white with blue border)
+    return f'''<td><a href="#" class="btn btn-sm btn-outline-primary file-link" 
+        data-file="file://{cell_val}" data-ext="{file_ext}" 
+        style="padding:5px 10px;text-decoration:none;">View</a></td>'''
 
 
 class PipedreamPaths:
@@ -919,8 +1495,13 @@ class PipedreamPaths:
         path = self.base_dir / f"{self.compound_code}{OUTPUT_SMILES_SUFFIX}"
         return str(path)
     
-    def find_electron_density_gif(self) -> str:
-        """Find the electron density movie GIF file."""
+    def find_electron_density_gif(self, ligand_id: str = None) -> str:
+        """
+        Find the electron density movie GIF file.
+        
+        Args:
+            ligand_id: Optional ligand ID (e.g., "LIG A4000") to find ligand-specific GIF
+        """
         if not self.base_dir or not self.compound_code:
             return 'NA'
         
@@ -928,10 +1509,39 @@ class PipedreamPaths:
         if not gif_dir.exists():
             return 'NA'
         
-        for gif_file in gif_dir.glob(f"*{ELECTRON_DENSITY_GIF_SUFFIX}"):
-            return str(gif_file)
+        # Get all available GIFs
+        all_gifs = list(gif_dir.glob(f"*{ELECTRON_DENSITY_GIF_SUFFIX}"))
+        if not all_gifs:
+            return 'NA'
         
-        return 'NA'
+        logging.debug(f"find_electron_density_gif called with ligand_id={ligand_id}")
+        
+        # If ligand_id is provided, try to find ligand-specific GIF
+        # Expected format: "LIG A4000" -> filename "A4000_electrondensity_movie.gif"
+        if ligand_id and ligand_id != 'NA':
+            # Parse ligand ID: "LIG A4000" -> restype="LIG", chain_resnum="A4000"
+            parts = ligand_id.split()
+            logging.debug(f"Parsed ligand_id '{ligand_id}' into {len(parts)} parts: {parts}")
+            if len(parts) == 2:
+                restype, chain_resnum = parts
+                # chain_resnum is like "A4000" where first char is chain, rest is resnum
+                # We need the GIF pattern: {CHAIN}{RESNUM}_electrondensity_movie.gif = A4000_electrondensity_movie.gif
+                
+                # Primary pattern: {CHAIN_RESNUM}_electrondensity_movie.gif
+                pattern = f"{chain_resnum}_{ELECTRON_DENSITY_GIF_SUFFIX}"
+                gif_path = gif_dir / pattern
+                logging.debug(f"Looking for ligand-specific GIF: {gif_path}")
+                if gif_path.exists():
+                    logging.info(f"Found ligand-specific density GIF for {ligand_id}: {gif_path}")
+                    return str(gif_path)
+                else:
+                    logging.warning(f"Ligand-specific GIF not found for {ligand_id}: expected {gif_path}")
+                    logging.info(f"Available GIFs in {gif_dir}: {[g.name for g in all_gifs]}")
+        
+        # Fall back to first GIF found (for single ligand or if specific not found)
+        fallback_gif = str(all_gifs[0])
+        logging.info(f"Using fallback density GIF: {fallback_gif}")
+        return fallback_gif
 
 
 class InputPaths:
@@ -1046,69 +1656,244 @@ class PostrefinementStats(TypedDict, total=False):
     Rfree: float
     MeanB: float
 
-@dataclass
-class ValidationThresholds:
-    """Validation thresholds for crystallographic quality assessment."""
-    ligand_cc: float = 0.8
-    rfree_max: float = 0.3
-    r_max: float = 0.3
-    mogul_z_max: float = 2.0
-    rama_outlier_max: float = 0.5
-    poor_rotamer_max: float = 2.0
-    clash_score_max: float = 20.0
-    molprobity_score_max: float = 2.0
-    b_factor_ratio: float = 1.5
-    rms_angles_max: float = 3.0
-    rms_bonds_max: float = 0.03
-
-THRESHOLDS = ValidationThresholds()
-
-def convert_mtz_to_map(mtz_file_path: str, map_type: MapType = '2fofc') -> str:
-    """Convert an MTZ file to a map file using gemmi."""
-    if mtz_file_path == 'NA':
-        return 'NA'
+def parse_edstats_for_ligand_rm(edstats_file: str, ligand_name: str = "LIG") -> Union[float, str]:
+    """
+    Parse edstats.out file to extract Rm value.
     
-    if not os.path.exists(mtz_file_path):
-        logging.warning(f"MTZ file not found: {mtz_file_path}")
-        return 'NA'
+    Args:
+        edstats_file: Path to the edstats.out file
+        ligand_name: Name of the ligand to search for (default: "LIG")
         
-    map_file_path = mtz_file_path.replace('.mtz', f'_{map_type}.map')
-    
-    if os.path.exists(map_file_path):
-        logging.debug(f"Map file already exists: {map_file_path}")
-        return map_file_path
-    
-    gemmi_available, gemmi_cmd = check_gemmi_availability()
-    if not gemmi_available:
-        logging.warning("gemmi command not available")
+    Returns:
+        Rm value as float, or 'NA' if not found
+    """
+    if not os.path.exists(edstats_file):
+        logging.debug(f"edstats file not found: {edstats_file}")
         return 'NA'
     
     try:
-        if map_type == '2fofc':
-            cmd = gemmi_cmd + ['sf2map', mtz_file_path, map_file_path]
-        elif map_type == 'fofc':
-            cmd = gemmi_cmd + ['sf2map', mtz_file_path, '-d', map_file_path]
-        else:
-            raise ValueError(f"Unknown map type: {map_type}")
+        with open(edstats_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                # Skip empty lines and header lines
+                line = line.strip()
+                if not line or line.startswith('//') or line.startswith('RT'):
+                    continue
+                
+                # Split the line into fields
+                fields = line.split()
+                if len(fields) < 6:
+                    continue
+                
+                # First field is residue type (RT)
+                residue_type = fields[0]
+                
+                if residue_type == ligand_name:
+                    # Rm is the 5th column (index 4) in the format:
+                    # RT  CI  RN     BAm  NPm   Rm    RGm  SRGm   CCSm   CCPm ...
+                    try:
+                        rm_value = float(fields[5])
+                        logging.debug(f"Found Rm value for {ligand_name}: {rm_value}")
+                        return rm_value
+                    except (ValueError, IndexError) as e:
+                        logging.warning(f"Could not parse Rm value from line: {line}, error: {e}")
+                        continue
         
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=True)
+        logging.warning(f"No {ligand_name} residue found")
+        return 'NA'  # Consistent string return instead of None
         
-        if os.path.exists(map_file_path):
-            logging.info(f"Successfully created map file: {map_file_path}")
-            return map_file_path
+    except (IOError, OSError) as e:
+        logging.error(f"Error reading edstats file {edstats_file}: {e}")
+        return 'NA'
+    except Exception as e:
+        logging.error(f"Unexpected error parsing edstats file: {e}")
+        logging.debug(f"Full traceback: {traceback.format_exc()}")
+        return 'NA'
+
+
+def parse_clash_out_for_ligand(clash_file: str, ligand_id: str = "LIG") -> int:
+    """
+    Parse clash.out file to count ligand clash instances.
+    
+    Args:
+        clash_file: Path to the clash.out file
+        ligand_id: Ligand ID to search for (e.g., "LIG" or "A4000 LIG")
+        
+    Returns:
+        Number of clash instances involving the ligand, or 0 if none found
+    """
+    if not os.path.exists(clash_file):
+        logging.debug(f"clash.out file not found: {clash_file}")
+        return 0
+    
+    try:
+        # Parse ligand_id to extract chain and residue info
+        # ligand_id format: "LIG A4000" or just "LIG"
+        ligand_parts = ligand_id.split()
+        
+        logging.debug(f"Parsing clash.out for ligand_id='{ligand_id}', parts={ligand_parts}")
+        
+        if len(ligand_parts) == 2:
+            restype, chain_resnum = ligand_parts
         else:
-            logging.error(f"gemmi succeeded but map file not created: {map_file_path}")
-            return 'NA'
+            restype = ligand_id
+            chain_resnum = None
+        
+        logging.debug(f"Looking for restype='{restype}', chain_resnum='{chain_resnum}'")
+        
+        clash_count = 0
+        
+        with open(clash_file, 'r', encoding='utf-8') as f:
+            in_clash_section = False
+            line_count = 0
+            for line in f:
+                line = line.strip()
+                
+                # Look for the clash section start
+                if 'Bad Clashes' in line:
+                    in_clash_section = True
+                    logging.debug(f"Found 'Bad Clashes' section")
+                    continue
+                
+                # Stop at clashscore line
+                if line.startswith('clashscore'):
+                    logging.debug(f"Reached clashscore line, stopping")
+                    break
+                
+                # Parse clash lines
+                if in_clash_section and line and not line.startswith('Using'):
+                    line_count += 1
+                    # Clash line format: " B 163  HIS  NE2  B4000  LIG  H1C :0.671"
+                    # Note: For ligands, chain+resnum is combined in one field (e.g., "B4000")
+                    # Split by whitespace
+                    parts = line.split()
+                    if len(parts) < 8:
+                        continue
+                    
+                    # Check if either position contains the ligand
+                    # Position 1: parts[0-3] (chain, resnum, restype, atom) - protein format
+                    # Position 2: parts[4-6] (chain_resnum_combined, restype, atom) - ligand format
+                    try:
+                        # Check position 1 (protein residue format)
+                        pos1_restype = parts[2]
+                        pos1_chain_resnum = parts[0] + parts[1]  # e.g., "B163"
+                        
+                        # Check position 2 (ligand format - chain+resnum already combined)
+                        pos2_chain_resnum = parts[4]  # e.g., "B4000" - already combined!
+                        pos2_restype = parts[5]
+                        
+                        # Match against our ligand
+                        match = False
+                        if chain_resnum:
+                            # Match specific chain+resnum (e.g., "A4000 LIG")
+                            if (pos1_restype == restype and pos1_chain_resnum == chain_resnum) or \
+                               (pos2_restype == restype and pos2_chain_resnum == chain_resnum):
+                                match = True
+                        else:
+                            # Match just residue type (e.g., "LIG")
+                            if pos1_restype == restype or pos2_restype == restype:
+                                match = True
+                        
+                        if match:
+                            clash_count += 1
+                            logging.debug(f"Found ligand clash: {line}")
+                    except (IndexError, ValueError) as e:
+                        logging.debug(f"Could not parse clash line: {line}, error: {e}")
+                        continue
             
-    except subprocess.TimeoutExpired:
-        logging.error(f"Timeout converting MTZ to map: {mtz_file_path}")
-        return 'NA'
-    except subprocess.CalledProcessError as e:
-        logging.error(f"gemmi conversion failed: {e.stderr}")
-        return 'NA'
-    except (OSError, PermissionError) as e:
-        logging.error(f"File system error during conversion: {e}")
-        return 'NA'
+            logging.debug(f"Processed {line_count} clash lines in total")
+        
+        if clash_count > 0:
+            logging.info(f"Found {clash_count} clash(es) for ligand {ligand_id}")
+        else:
+            logging.debug(f"No clashes found for ligand {ligand_id}")
+        
+        return clash_count
+        
+    except (IOError, OSError) as e:
+        logging.error(f"Error reading clash.out file {clash_file}: {e}")
+        return 0
+    except Exception as e:
+        logging.error(f"Unexpected error parsing clash.out file: {e}")
+        logging.debug(f"Full traceback: {traceback.format_exc()}")
+        return 0
+
+
+def validate_structure_file(file_path: str, file_type: str) -> bool:
+    """
+    Validate that a structure file exists and is safe to use.
+    
+    Args:
+        file_path: Path to the file to validate
+        file_type: Type of file (e.g., 'pdb', 'mtz', 'map', 'cif')
+        
+    Returns:
+        True if file is valid, False otherwise
+    """
+    if not file_path or file_path == 'NA':
+        return False
+    
+    # Check file exists
+    if not os.path.exists(file_path):
+        return False
+    
+    # Check it's a file (not a directory)
+    if not os.path.isfile(file_path):
+        return False
+    
+    # Check file is readable
+    if not os.access(file_path, os.R_OK):
+        return False
+    
+    return True
+
+
+def _determine_xce_export(composite_score: Any, r_factor: Any, rfree: Any) -> str:
+    """
+    Determine if a structure should be exported to XCE.
+    
+    Criteria:
+    - Composite Quality Score >= 75
+    - R <= 0.3 (30%)
+    - Rfree <= 0.3 (30%)
+    
+    Args:
+        composite_score: Composite Quality Score
+        r_factor: R-factor
+        rfree: Rfree value
+        
+    Returns:
+        'True' or 'False' string
+    """
+    # Check composite score
+    if composite_score in ['NA', None]:
+        return 'False'
+    
+    try:
+        score = float(composite_score)
+        if score < 75:
+            return 'False'
+    except (ValueError, TypeError):
+        return 'False'
+    
+    # Check R-factor
+    if r_factor not in ['NA', None]:
+        try:
+            r_val = float(r_factor)
+            if r_val > THRESHOLDS.r_max:
+                return 'False'
+        except (ValueError, TypeError):
+            pass  # If can't parse, don't reject based on this
+    
+    # Check Rfree
+    if rfree not in ['NA', None]:
+        try:
+            rfree_val = float(rfree)
+            if rfree_val > THRESHOLDS.rfree_max:
+                return 'False'
+        except (ValueError, TypeError):
+            pass  # If can't parse, don't reject based on this
+    
+    return 'True'
 
 
 def build_result(
@@ -1125,7 +1910,11 @@ def build_result(
     mtz_file: str = 'NA',
     map_2fofc_file: str = 'NA',
     map_fofc_file: str = 'NA',
-    high_resolution: str = 'NA'
+    high_resolution: str = 'NA',
+    low_resolution: str = 'NA',
+    ligand_rsr: Optional[float] = None,
+    heavy_atoms: int = 0,
+    ligand_clashes: int = 0
 ) -> Dict[str, Any]:
     """Build a result dictionary for a dataset."""
     # Construct ligand SVG diagram path from Input_dir and CompoundCode
@@ -1133,10 +1922,33 @@ def build_result(
     compound_code = info.get('CompoundCode', 'NA')
     ligand_png = get_ligand_png_path(input_dir, compound_code)
     
+    # Calculate quality scores
+    ligand_cc = safe_dict_get(ligand_stats, 'ligandcc')
+    mogul_z_angle = safe_dict_get(ligand_stats, 'mogulzangl')
+    mogul_z_bond = safe_dict_get(ligand_stats, 'mogulzbond')
+    ligand_mean_b = safe_dict_get(ligand_stats, 'ligandbavg')
+    global_mean_b = safe_dict_get(postrefinement_stats, 'MeanB')
+    
+    quality_scores = calculate_quality_scores(
+        ligand_cc, 
+        ligand_rsr, 
+        mogul_z_bond, 
+        mogul_z_angle,
+        ligand_mean_b,
+        global_mean_b,
+        ligand_clashes
+    )
+    
+    # Calculate clashes per atom
+    if heavy_atoms > 0 and ligand_clashes >= 0:
+        clashes_per_atom = ligand_clashes / heavy_atoms
+    else:
+        clashes_per_atom = 'NA'
+    
     return {
         'Crystal Name': dataset,
         'Compound Code': compound_code,
-        'Input Ligand Structure': ligand_png,
+        'Ligand Structure': ligand_png,
         'Ligand Density': electron_density_gif,
         'Chiral inversion': chirality_flip,
         'Pipedream Directory': info.get('PipedreamDirectory', 'NA'),
@@ -1149,52 +1961,78 @@ def build_result(
         'Fo-Fc Map File': map_fofc_file,
         'Output SMILES': updated_smiles_file,
         'Ligand ID': safe_dict_get(ligand_stats, 'ligandid'),
-        'Ligand CC': safe_dict_get(ligand_stats, 'ligandcc'),
+        'Ligand CC': ligand_cc,
+        'Ligand RSR': ligand_rsr if ligand_rsr is not None else 'NA',
+        'Ligand Fit Quality Score': quality_scores['Ligand Fit Quality Score'],
+        'Ligand Fit PCA Percentile (Batch)': 'NA',  # Will be calculated after all results collected
+        'Ligand Fit PCA Percentile (PDB)': 'NA',  # Will be calculated after all results collected
+        'Mogul Z Angle': mogul_z_angle,
+        'Mogul Z Bond': mogul_z_bond,
+        'Ligand Geometry Quality Score': quality_scores['Ligand Geometry Quality Score'],
+        'Ligand Geometry PCA Percentile (Batch)': 'NA',  # Will be calculated after all results collected
+        'Ligand Geometry PCA Percentile (PDB)': 'NA',  # Will be calculated after all results collected
+        'PCA Percentile Plot (Batch)': 'NA',  # Will be generated after batch percentiles calculated
+        'PCA Percentile Plot (PDB)': 'NA',  # Will be generated after PDB percentiles calculated
+        'Spider Plot': 'NA',  # Will be generated after all metrics collected
+        'Composite Quality Score': quality_scores['Composite Quality Score'],
         'R': safe_round(safe_dict_get(postrefinement_stats, 'R')),
         'Rfree': safe_round(safe_dict_get(postrefinement_stats, 'Rfree')),
-        'Ligand avg B factor': safe_dict_get(ligand_stats, 'ligandbavg'),
-        'Ligand occupancy': safe_dict_get(ligand_stats, 'ligandomin'),
-        'Mogul Z angle': safe_dict_get(ligand_stats, 'mogulzangl'),
-        'Mogul Z bond': safe_dict_get(ligand_stats, 'mogulzbond'),
-        'c beta deviations': safe_dict_get(molprobity_stats, 'cbetadeviations'),
-        'Rama outlier percent': safe_dict_get(molprobity_stats, 'ramaoutlierpercent'),
-        'Rama favored percent': safe_dict_get(molprobity_stats, 'ramafavoredpercent'),
-        'Poor rotamer percent': safe_dict_get(molprobity_stats, 'poorrotamerspercent'),
-        'Clash score': safe_dict_get(molprobity_stats, 'clashscore'),
-        'Mol probity score': safe_dict_get(molprobity_stats, 'molprobityscore'),
-        'RMS bonds': safe_dict_get(molprobity_stats, 'rmsbonds'),
-        'RMS angles': safe_dict_get(molprobity_stats, 'rmsangles'),
-        'Mean B factor': safe_dict_get(postrefinement_stats, 'MeanB'),
-        'High resolution (A)': high_resolution,
+        'Ligand Mean B Factor': safe_dict_get(ligand_stats, 'ligandbavg'),
+        'Ligand Occupancy': safe_dict_get(ligand_stats, 'ligandomin'),
+        'Ligand Atoms': heavy_atoms if heavy_atoms > 0 else 'NA',
+        'Ligand Clashes': ligand_clashes if ligand_clashes >= 0 else 'NA',
+        'Ligand Clashes per Atom': clashes_per_atom if clashes_per_atom != 'NA' else 'NA',
+        'C-beta Deviations': safe_dict_get(molprobity_stats, 'cbetadeviations'),
+        'Rama Outlier Percent': safe_dict_get(molprobity_stats, 'ramaoutlierpercent'),
+        'Rama Favored Percent': safe_dict_get(molprobity_stats, 'ramafavoredpercent'),
+        'Poor Rotamer Percent': safe_dict_get(molprobity_stats, 'poorrotamerspercent'),
+        'Clash Score': safe_dict_get(molprobity_stats, 'clashscore'),
+        'Mol Probity Score': safe_dict_get(molprobity_stats, 'molprobityscore'),
+        'RMS Bonds': safe_dict_get(molprobity_stats, 'rmsbonds'),
+        'RMS Angles': safe_dict_get(molprobity_stats, 'rmsangles'),
+        'Mean B Factor': safe_dict_get(postrefinement_stats, 'MeanB'),
+        'High Resolution (Å)': high_resolution,
+        'Low Resolution (Å)': low_resolution,
         'Comments': '',
-        'Export to XCE': 'True' if (isinstance(ligand_stats, dict) and ligand_stats.get('ligandcc', 0) > THRESHOLDS.ligand_cc) else 'False'
+        'Export to XCE': _determine_xce_export(quality_scores['Composite Quality Score'], 
+                                               safe_dict_get(postrefinement_stats, 'R'),
+                                               safe_dict_get(postrefinement_stats, 'Rfree'))
     }
 
 
-def collect_results_from_json(json_data: dict) -> List[Dict[str, Any]]:
+def collect_results_from_json(json_data: dict, config: Optional['Config'] = None) -> List[Dict[str, Any]]:
     """Collect results from the JSON data for all datasets."""
-    # Input validation
-    if not json_data:
-        logging.warning("No data provided to collect_results_from_json")
-        return []
+    if config is None:
+        config = Config()
     
     results = []
     total_datasets = len(json_data)
     logging.info(f"Processing {total_datasets} datasets")
-    print(f"Processing {total_datasets} datasets...")  # Console progress
     
-    # Check gemmi availability once for all datasets (not per dataset)
-    gemmi_available, gemmi_cmd = check_gemmi_availability()
-    if gemmi_available:
-        logging.info("gemmi is available for map generation")
+    # Progress bar setup
+    if HAS_TQDM:
+        # Show progress bar
+        print(f"Processing {total_datasets} datasets...")
+        iterator = tqdm(
+            json_data.items(),
+            total=total_datasets,
+            desc="Processing datasets",
+            unit="dataset",
+            ncols=80,
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+        )
     else:
-        logging.info("gemmi not available, map generation will be skipped")
+        # No tqdm: show periodic updates
+        print(f"Processing {total_datasets} datasets...")
+        iterator = json_data.items()
     
-    for i, (dataset, info) in enumerate(json_data.items(), 1):
+    for i, (dataset, info) in enumerate(iterator, 1):
         logging.info(f"Processing dataset {i}/{total_datasets}: {dataset}")
         
-        if i % 10 == 0 or i == 1 or i == total_datasets:
-            print(f"Progress: {i}/{total_datasets} datasets processed")
+        # Show progress updates without tqdm
+        if not HAS_TQDM:
+            if i % 10 == 0 or i == 1 or i == total_datasets:
+                print(f"Progress: {i}/{total_datasets} datasets processed")
         
         summary_file = info.get('ExpectedSummary', 'NA')
         
@@ -1220,13 +2058,42 @@ def collect_results_from_json(json_data: dict) -> List[Dict[str, Any]]:
             except (ValueError, TypeError):
                 high_resolution = 'NA'
         
-        # Extract validation statistics
-        ligand = safe_get(summary, ['ligandfitting', 'ligands', 0])
-        ligand_stats = safe_get(ligand, ['validationstatistics', 'ligandstatistics', 0])
-        molprobity_stats = safe_get(ligand, ['validationstatistics', 'molprobity'])
-        postrefinement_stats = safe_get(ligand, ['postrefinement', 1])
+        # Extract low resolution from dataprocessing.inputdata.reslo
+        low_resolution = safe_get(summary, ['dataprocessing', 'inputdata', 'reslo'], 'NA')
+        if low_resolution != 'NA':
+            try:
+                low_resolution = f"{float(low_resolution):.2f}"
+            except (ValueError, TypeError):
+                low_resolution = 'NA'
         
-        # Extract key directory and compound information
+        # Extract validation statistics - handle multiple ligands
+        ligands_array = safe_get(summary, ['ligandfitting', 'ligands'], [])
+        if not isinstance(ligands_array, list):
+            ligands_array = [ligands_array] if ligands_array else []
+        
+        # Check if ligands were found
+        if not ligands_array:
+            logging.warning(f"No ligands found in summary for {dataset}")
+            ligands_array = [{}]
+        
+        # Get the first ligand entry (usually there's only one at this level)
+        first_ligand = ligands_array[0] if ligands_array else {}
+        
+        # Extract ligandstatistics array - this is where multiple ligands actually are
+        ligandstatistics_array = safe_get(first_ligand, ['validationstatistics', 'ligandstatistics'], [])
+        if not isinstance(ligandstatistics_array, list):
+            ligandstatistics_array = [ligandstatistics_array] if ligandstatistics_array else []
+        
+        # If no ligand statistics found, create a dummy entry
+        if not ligandstatistics_array:
+            logging.debug(f"No ligand statistics found for {dataset}, using empty entry")
+            ligandstatistics_array = [{}]
+        
+        num_ligands = len(ligandstatistics_array)
+        if num_ligands > 1:
+            logging.info(f"Dataset {dataset} contains {num_ligands} ligands - will create separate entries")
+        
+        # Extract key directory and compound information (shared across all ligands)
         pipedream_dir = info.get('PipedreamDirectory', 'NA')
         compound_code = info.get('CompoundCode', 'NA')
         input_dir = info.get('Input_dir', 'NA')
@@ -1241,19 +2108,19 @@ def collect_results_from_json(json_data: dict) -> List[Dict[str, Any]]:
         pipedream_paths = PipedreamPaths(pipedream_dir, compound_code)
         input_paths = InputPaths(input_dir, compound_code)
         
-        # Get all file paths using helper classes
-        pdb_file = pipedream_paths.rhofit_file(REFINE_PDB_FILENAME)
+        # Get all file paths using helper classes (shared files)
+        pdb_file = pipedream_paths.postrefine_file(REFINE_PDB_FILENAME)
         output_cif_file = pipedream_paths.rhofit_file(BEST_CIF_FILENAME)
         mtz_file = pipedream_paths.postrefine_file(REFINE_MTZ_FILENAME)
-        electron_density_gif = pipedream_paths.find_electron_density_gif()
-        
+        # Note: electron_density_gif will be retrieved per-ligand below
+
         # Get input files
         input_files = input_paths.all_files()
         input_smi_path = input_files['smiles']
         input_pdb_path = input_files['pdb']
         input_cif_path = input_files['cif']
         
-        # Fallback to JSON parsing if needed
+        # Fallback to JSON parsing if needed (for first ligand)
         if pdb_file == 'NA' or output_cif_file == 'NA':
             logging.debug(f"Using fallback JSON parsing for missing files")
             postrefinement = safe_get(summary, ['pipedream_outputs', 'ligandfitting', 'ligands', 0, 'postrefinement'], [])
@@ -1273,526 +2140,397 @@ def collect_results_from_json(json_data: dict) -> List[Dict[str, Any]]:
                                 entry.get('filename', '')
                             )
         
-        # Generate map files
-        if gemmi_available and mtz_file != 'NA':
-            logging.debug(f"Generating map files for: {mtz_file}")
-            map_2fofc_file = convert_mtz_to_map(mtz_file, '2fofc')
-            map_fofc_file = convert_mtz_to_map(mtz_file, 'fofc')
+        # Look for existing edstats output file (don't regenerate)
+        map_2fofc_file = 'NA'
+        map_fofc_file = 'NA'
+        edstats_output = 'NA'
+        
+        # Check for existing edstats.out file in postrefine directory
+        # This aligns with pipedream_xchem.py and pipedream_post_process.py which save edstats.out in postrefine-{compound_code}/
+        edstats_path = pipedream_paths.postrefine_file('edstats.out')
+        if edstats_path != 'NA':
+            edstats_output = edstats_path
+            logging.debug(f"Using existing edstats output: {edstats_output}")
         else:
-            map_2fofc_file = 'NA'
-            map_fofc_file = 'NA'
+            logging.debug(f"No edstats output found for dataset: {dataset}")
         
         # Use best.pdb for chirality analysis
         chirality_pdb_file = pipedream_paths.rhofit_file(BEST_PDB_FILENAME)
         
-        # Perform chirality analysis
-        # Always prioritize using CIF input file when available
-        # Input: Must have CIF (PDB optional), Output: Must have both CIF and PDB
-        if (input_cif_path != 'NA' and output_cif_file != 'NA' and 
-            chirality_pdb_file != 'NA' and input_smi_path != 'NA'):
+        # Process each ligand separately
+        for ligand_idx, ligand_stats in enumerate(ligandstatistics_array):
+            # ligand_stats now contains the individual ligand statistics
+            # Get molprobity and postrefinement stats from the parent ligand entry
+            molprobity_stats = safe_get(first_ligand, ['validationstatistics', 'molprobity'])
+            postrefinement_stats = safe_get(first_ligand, ['postrefinement', 1])
             
-            logging.debug(f"Using CIF+PDB approach for chirality analysis of {dataset}")
-            chirality_flip, updated_smiles = compare_chiral_centers_cif_pdb(
-                input_cif_path, input_pdb_path, output_cif_file, chirality_pdb_file, input_smi_path, dataset)
+            # Get ligand ID if available
+            ligand_id = safe_dict_get(ligand_stats, 'ligandid', 'NA')
             
-            # Save SMILES file
-            smiles_file = _save_smiles_file(pipedream_dir, compound_code, 
-                                            chirality_flip, updated_smiles, "CIF+PDB", dataset)
+            # Get ligand-specific electron density GIF
+            electron_density_gif = pipedream_paths.find_electron_density_gif(ligand_id)
             
-        # Fallback to original SMILES+PDB approach if CIF requirements not met
-        elif input_smi_path != 'NA' and chirality_pdb_file != 'NA':
-            missing_cif_info = []
-            if input_cif_path == 'NA':
-                missing_cif_info.append("input CIF")
-            if output_cif_file == 'NA':
-                missing_cif_info.append("output CIF")
+            # Parse ligand-specific RSR from edstats if available
+            ligand_rsr = None
+            if edstats_output != 'NA' and ligand_id != 'NA':
+                # Extract just the residue type from ligand_id (e.g., "LIG A4000" -> "LIG")
+                # ligand_id format is typically: "RESTYPE CHAIN RESNUM" or just "RESTYPE"
+                residue_type = ligand_id.split()[0] if ' ' in ligand_id else ligand_id
+                ligand_rsr = parse_edstats_for_ligand_rm(edstats_output, residue_type)
+                if ligand_rsr is not None and ligand_rsr != 'NA':
+                    logging.debug(f"Extracted Ligand RSR (Rm) for {dataset} ligand {ligand_id}: {ligand_rsr}")
             
-            logging.debug(f"CIF requirements not met (missing: {', '.join(missing_cif_info)}), using fallback SMILES+PDB approach for {dataset}")
-            chirality_flip, updated_smiles = detect_chiral_inversion(input_smi_path, chirality_pdb_file, input_pdb_path, pipedream_dir, compound_code)
+            # Parse ligand-specific clashes from clash.out if available
+            ligand_clashes = 0
+            if pipedream_dir != 'NA' and compound_code != 'NA' and ligand_id != 'NA':
+                # Construct path to clash.out: PipedreamDirectory/report-<compound_code>/molprobe/clash.out
+                clash_file = os.path.join(pipedream_dir, f"report-{compound_code}", "molprobe", "clash.out")
+                if os.path.exists(clash_file):
+                    ligand_clashes = parse_clash_out_for_ligand(clash_file, ligand_id)
+                    logging.debug(f"Extracted {ligand_clashes} clash(es) for {dataset} ligand {ligand_id}")
+                else:
+                    logging.debug(f"clash.out not found at: {clash_file}")
             
-            # Construct expected path to analysis file - directly without condition
-            expected_smiles_file = get_output_smiles_path(pipedream_dir, compound_code)
-            smiles_file = expected_smiles_file if os.path.exists(expected_smiles_file) else 'NA'
-        
-        else:
-            missing_info = []
-            if input_smi_path == 'NA':
-                missing_info.append("SMILES file")
-            if chirality_pdb_file == 'NA':
-                missing_info.append("output PDB file")
-            chirality_flip = f"Missing: {', '.join(missing_info)}"
-            smiles_file = "NA"
-            logging.warning(f"Skipping chirality analysis for {dataset}: {chirality_flip}")
-        
-        # Build result
-        result = build_result(
-            dataset=dataset,
-            info=info,
-            summary_file=summary_file,
-            ligand_stats=ligand_stats,
-            molprobity_stats=molprobity_stats,
-            postrefinement_stats=postrefinement_stats,
-            electron_density_gif=electron_density_gif,
-            chirality_flip=chirality_flip,
-            updated_smiles_file=smiles_file,
-            pdb_file=pdb_file,
-            mtz_file=mtz_file,
-            map_2fofc_file=map_2fofc_file,
-            map_fofc_file=map_fofc_file,
-            high_resolution=high_resolution
-        )
-        results.append(result)
+            # Perform chirality analysis for each ligand
+            # Always prioritize using CIF input file when available
+            # Unified chirality detection - prefers CIF, falls back to SMILES template
+            heavy_atoms = 0  # Initialize atom count
+            
+            if input_smi_path != 'NA' and chirality_pdb_file != 'NA':
+                logging.debug(f"Performing chirality analysis for {dataset} ligand {ligand_id}")
+                
+                # Unified function handles both CIF (preferred) and SMILES fallback approaches
+                chirality_flip, updated_smiles, heavy_atoms = compare_chiral_centers_cif_pdb(
+                    input_cif_path, input_pdb_path, output_cif_file, chirality_pdb_file, input_smi_path, dataset)
+                
+                # Determine method used from result prefix
+                method = "CIF+PDB" if "[CIF]" in chirality_flip else "SMILES+PDB"
+                
+                # Save SMILES file
+                smiles_file = _save_smiles_file(pipedream_dir, compound_code, 
+                                                chirality_flip, updated_smiles, method, dataset)
+            
+            else:
+                missing_info = []
+                if input_smi_path == 'NA':
+                    missing_info.append("SMILES file")
+                if chirality_pdb_file == 'NA':
+                    missing_info.append("output PDB file")
+                chirality_flip = f"Missing: {', '.join(missing_info)}"
+                smiles_file = "NA"
+                logging.warning(f"Skipping chirality analysis for {dataset} ligand {ligand_id}: {chirality_flip}")
+            
+            dataset_name = dataset
+            if num_ligands > 1:
+                logging.debug(f"Creating entry for {dataset_name} with ligand {ligand_id}")
+            
+            # Build result for this ligand
+            result = build_result(
+                dataset=dataset_name,
+                info=info,
+                summary_file=summary_file,
+                ligand_stats=ligand_stats,
+                molprobity_stats=molprobity_stats,
+                postrefinement_stats=postrefinement_stats,
+                electron_density_gif=electron_density_gif,
+                chirality_flip=chirality_flip,
+                updated_smiles_file=smiles_file,
+                pdb_file=pdb_file,
+                mtz_file=mtz_file,
+                map_2fofc_file=map_2fofc_file,
+                map_fofc_file=map_fofc_file,
+                high_resolution=high_resolution,
+                low_resolution=low_resolution,
+                ligand_rsr=ligand_rsr,
+                heavy_atoms=heavy_atoms,
+                ligand_clashes=ligand_clashes
+            )
+            results.append(result)
     
     return results
 
 
-def get_cell_style_and_value(col: str, cell_val: Any, row: pd.Series) -> tuple[str, str]:
+def get_cell_style_and_value(col: str, cell_val: Any, row: pd.Series, df: pd.DataFrame = None) -> tuple[str, str]:
     """Get the appropriate styling and display value for a table cell."""
     style = ''
-    display_val = str(cell_val)
     
-    # Try to format numbers to 2 decimal places if possible
-    try:
-        num_val = float(cell_val)
-        display_val = f"{num_val:.2f}"
-    except (ValueError, TypeError):
-        pass
-    
-    # Apply numeric highlighting rules
-    try:
-        val = float(cell_val)
-        if col == 'Rfree' and val > THRESHOLDS.rfree_max:
-            style = 'background-color: #ffcccc; font-weight: bold;'
-        elif col == 'R' and val > THRESHOLDS.r_max:
-            style = 'background-color: #ffcccc; font-weight: bold;'
-        elif col == 'Mogul Z angle' and val > THRESHOLDS.mogul_z_max:
-            style = 'background-color: #ffcccc; font-weight: bold;'
-        elif col == 'Mogul Z bond' and val > THRESHOLDS.mogul_z_max:
-            style = 'background-color: #ffcccc; font-weight: bold;'
-        elif col == 'Ligand avg B factor':
+    # Check for NaN/nan/None and standardize to "NA"
+    if pd.isna(cell_val) or cell_val is None or str(cell_val).lower() in ['nan', 'none', '']:
+        display_val = 'NA'
+    else:
+        display_val = str(cell_val)
+        
+        # Try to format numbers to 2 decimal places if possible (except for integer columns)
+        if col not in ['Ligand Atoms', 'Ligand Clashes', 'C-beta Deviations']:  # Integer columns - no decimals
             try:
-                mean_b = float(row['Mean B factor'])
-                if mean_b != 0 and val / mean_b >= THRESHOLDS.b_factor_ratio:
-                    style = 'background-color: #ffcccc; font-weight: bold;'
-            except (ValueError, TypeError, ZeroDivisionError):
+                num_val = float(cell_val)
+                display_val = f"{num_val:.2f}"
+            except (ValueError, TypeError):
                 pass
-        elif col == 'Rama outlier percent' and val > THRESHOLDS.rama_outlier_max:
-            style = 'background-color: #ffcccc; font-weight: bold;'
-        elif col == 'Poor rotamer percent' and val > THRESHOLDS.poor_rotamer_max:
-            style = 'background-color: #ffcccc; font-weight: bold;'
-        elif col == 'Clash score' and val > THRESHOLDS.clash_score_max:
-            style = 'background-color: #ffcccc; font-weight: bold;'
-        elif col == 'Mol probity score' and val > THRESHOLDS.molprobity_score_max:
-            style = 'background-color: #ffcccc; font-weight: bold;'
-        elif col == 'RMS angles' and val > THRESHOLDS.rms_angles_max:
-            style = 'background-color: #ffcccc; font-weight: bold;'
-        elif col == 'RMS bonds' and val > THRESHOLDS.rms_bonds_max:
-            style = 'background-color: #ffcccc; font-weight: bold;'
-    except (ValueError, TypeError):
-        pass
+    
+    # Special styling for Crystal Name - purple border if dataset has multiple ligands
+    if col == 'Crystal Name' and df is not None:
+        crystal_name = str(cell_val)
+        # Count how many entries have this crystal name (same dataset)
+        same_dataset_count = len(df[df['Crystal Name'] == crystal_name])
+        if same_dataset_count > 1:
+            style = 'font-weight: bold; border: 3px solid #800080;'  # Purple border for multi-ligand
+    
+    # Special styling for Compound Code - green/yellow/red based on quality ranking
+    if col == 'Compound Code' and df is not None:
+        compound_code = str(cell_val)
+        if compound_code != 'NA':
+            # Get all rows with this compound code
+            compound_rows = df[df['Compound Code'] == compound_code]
+            num_occurrences = len(compound_rows)
+            
+            if num_occurrences > 1:
+                # Multiple entries for this compound - rank by Composite Quality Score
+                try:
+                    # Get composite quality scores for this compound
+                    quality_scores = pd.to_numeric(compound_rows['Composite Quality Score'], errors='coerce')
+                    max_score = quality_scores.max()
+                    min_score = quality_scores.min()
+                    current_score = pd.to_numeric(row['Composite Quality Score'], errors='coerce')
+                    
+                    if pd.notna(current_score) and pd.notna(max_score) and pd.notna(min_score):
+                        # If this row has the highest score, highlight it green
+                        if current_score == max_score:
+                            base_color = '#B8E6B8'  # Green for best quality
+                        # If this row has the lowest score, highlight it red
+                        elif current_score == min_score:
+                            base_color = '#FFB3B3'  # Red for worst quality
+                        # Everything in between is yellow
+                        else:
+                            base_color = '#FFF4C4'  # Yellow for middle quality
+                        
+                        # Add purple border for duplicates
+                        style = f'background-color: {base_color}; font-weight: bold; border: 3px solid #800080;'
+                except (ValueError, TypeError, KeyError):
+                    pass
+            else:
+                # Single occurrence - color it green
+                style = 'background-color: #B8E6B8; font-weight: bold;'
+    
+    # Apply numeric highlighting rules (only if no style already set)
+    if not style:
+        try:
+            val = float(cell_val)
+            if col == 'Ligand CC':
+                # Color-coded Ligand CC thresholds with consistent pastel colors
+                if val >= 0.95:  # Very good fit
+                    style = 'background-color: #B8E6B8; font-weight: bold;'  # Pastel green
+                elif val >= 0.90:  # Good fit
+                    style = 'background-color: #D4F1D4; font-weight: bold;'  # Lighter pastel green
+                elif val >= 0.80:  # OK fit
+                    style = 'background-color: #FFF4C4; font-weight: bold;'  # Pastel yellow
+                else:  # Poor fit (< 0.80)
+                    style = 'background-color: #FFB3B3; font-weight: bold;'  # Pastel red
+            elif col == 'Ligand RSR':
+                # Color-coded Ligand RSR thresholds (lower is better)
+                if val < 0.2:  # Very good
+                    style = 'background-color: #B8E6B8; font-weight: bold;'  # Pastel green
+                elif val < 0.3:  # Good
+                    style = 'background-color: #D4F1D4; font-weight: bold;'  # Lighter pastel green
+                elif val < 0.4:  # OK
+                    style = 'background-color: #FFF4C4; font-weight: bold;'  # Pastel yellow
+                else:  # Poor (>= 0.4)
+                    style = 'background-color: #FFB3B3; font-weight: bold;'  # Pastel red
+            elif col in ['Ligand Fit Quality Score', 'Ligand Geometry Quality Score', 'Composite Quality Score',
+                        'Ligand Fit PCA Percentile (Batch)', 'Ligand Geometry PCA Percentile (Batch)',
+                        'Ligand Fit PCA Percentile (PDB)', 'Ligand Geometry PCA Percentile (PDB)']:
+                # Quality scores are 0-100, higher is better
+                if val >= 75:  # Excellent
+                    style = 'background-color: #B8E6B8; font-weight: bold;'  # Pastel green
+                elif val >= 50:  # Good/OK
+                    style = 'background-color: #FFF4C4; font-weight: bold;'  # Pastel yellow
+                else:  # Poor (< 50)
+                    style = 'background-color: #FFB3B3; font-weight: bold;'  # Pastel red
+            elif col in ['Mogul Z Angle', 'Mogul Z Bond']:
+                # Color-coded Mogul Z score thresholds with consistent pastel colors
+                if val > THRESHOLDS.mogul_z_poor:  # Z > 4: bad
+                    style = 'background-color: #D4B8E6; font-weight: bold;'  # Pastel purple
+                elif val > THRESHOLDS.mogul_z_ok:  # 2.5 < Z < 4: poor
+                    style = 'background-color: #E6D4F1; font-weight: bold;'  # Lighter pastel purple
+                elif val > THRESHOLDS.mogul_z_good:  # 1.5 < Z < 2.5: ok
+                    style = 'background-color: #FFF4C4; font-weight: bold;'  # Pastel yellow
+                else:  # Z < 1.5: good
+                    style = 'background-color: #B8E6B8; font-weight: bold;'  # Pastel green
+            elif col == 'Rfree' and val > THRESHOLDS.rfree_max:
+                style = 'background-color: #FFB3B3; font-weight: bold;'  # Pastel red
+            elif col == 'R' and val > THRESHOLDS.r_max:
+                style = 'background-color: #FFB3B3; font-weight: bold;'  # Pastel red
+            elif col == 'Ligand Mean B Factor':
+                try:
+                    mean_b = float(row['Mean B Factor'])
+                    if mean_b != 0 and val / mean_b >= THRESHOLDS.b_factor_ratio:
+                        style = 'background-color: #FFB3B3; font-weight: bold;'  # Pastel red
+                except (ValueError, TypeError, ZeroDivisionError):
+                    pass
+            elif col == 'Rama Favored Percent' and val >= 98.0:
+                style = 'background-color: #B8E6B8; font-weight: bold;'  # Pastel green
+            elif col == 'Rama Outlier Percent' and val > THRESHOLDS.rama_outlier_max:
+                style = 'background-color: #FFB3B3; font-weight: bold;'  # Pastel red
+            elif col == 'Poor Rotamer Percent' and val > THRESHOLDS.poor_rotamer_max:
+                style = 'background-color: #FFB3B3; font-weight: bold;'  # Pastel red
+            elif col == 'Clash Score' and val > THRESHOLDS.clash_score_max:
+                style = 'background-color: #FFB3B3; font-weight: bold;'  # Pastel red
+            elif col == 'Mol Probity Score' and val > THRESHOLDS.molprobity_score_max:
+                style = 'background-color: #FFB3B3; font-weight: bold;'  # Pastel red
+            elif col == 'RMS Angles' and val > THRESHOLDS.rms_angles_max:
+                style = 'background-color: #FFB3B3; font-weight: bold;'  # Pastel red
+            elif col == 'RMS Bonds' and val > THRESHOLDS.rms_bonds_max:
+                style = 'background-color: #FFB3B3; font-weight: bold;'  # Pastel red
+        except (ValueError, TypeError):
+            pass
     
     return style, display_val
 
 
-def get_cell_html(col: str, cell_val: Any, row: pd.Series) -> str:
+def get_cell_html(col: str, cell_val: Any, row: pd.Series, df: pd.DataFrame = None) -> str:
     """Generate HTML for a specific table cell based on column type."""
     if col == 'Export to XCE':
         return f'<td><input type="checkbox" {"checked" if cell_val == "True" else ""}></td>'
     elif col == 'Comments':
         return f'<td><input type="text" value="{cell_val}"></td>'
-    elif col == 'Input Ligand Structure':
+    elif col == 'Ligand Structure':
         return f'<td><img src="file://{cell_val}" alt="Ligand Image" width="150"></td>' if cell_val and cell_val != 'NA' else '<td></td>'
     elif col == 'Ligand Density':
         return f'<td><img src="file://{cell_val}" alt="Ligand Density" width="180" style="max-width:180px;max-height:120px;"></td>' if cell_val and cell_val != 'NA' else '<td></td>'
+    elif col == 'PCA Percentile Plot (Batch)':
+        # Check if cell_val is a valid path (not the column name itself)
+        if cell_val and cell_val != 'NA' and str(cell_val).endswith('.html'):
+            # Return button styled like the other plot buttons
+            return f'''<td><a href="#" class="btn btn-sm btn-outline-primary file-link" 
+                data-file="file://{os.path.abspath(cell_val)}" data-ext=".html" 
+                style="padding:5px 10px;text-decoration:none;">View</a></td>'''
+        else:
+            return '<td></td>'
+    elif col == 'PCA Percentile Plot (PDB)':
+        # Check if cell_val is a valid path (not the column name itself)
+        if cell_val and cell_val != 'NA' and str(cell_val).endswith('.html'):
+            # Return button styled like the other plot buttons
+            return f'''<td><a href="#" class="btn btn-sm btn-outline-primary file-link" 
+                data-file="file://{os.path.abspath(cell_val)}" data-ext=".html" 
+                style="padding:5px 10px;text-decoration:none;">View</a></td>'''
+        else:
+            return '<td></td>'
+    elif col == 'Spider Plot':
+        # Check if cell_val is a valid path (not the column name itself)
+        if cell_val and cell_val != 'NA' and str(cell_val).endswith('.html'):
+            # Return button styled like the other plot buttons
+            return f'''<td><a href="#" class="btn btn-sm btn-outline-primary file-link" 
+                data-file="file://{os.path.abspath(cell_val)}" data-ext=".html" 
+                style="padding:5px 10px;text-decoration:none;">View</a></td>'''
+        else:
+            return '<td></td>'
     elif col == 'Chiral inversion':
-        return f'<td style="color:red;font-weight:bold">{cell_val}</td>' if cell_val and cell_val not in ['Output stereochemistry matches input', 'Not checked'] else f'<td>{cell_val}</td>'
+        # Check if stereochemistry matches (starts with 'Stereochemistry matches input')
+        is_match = cell_val and (cell_val.startswith('Stereochemistry matches input') or cell_val == 'Not checked')
+        return f'<td>{cell_val}</td>' if is_match else f'<td style="color:red;font-weight:bold">{cell_val}</td>'
     elif col in [
         'Pipedream Directory', 'Buster Report HTML', 'Ligand Report HTML', 'Pipedream Summary',
         'PDB File', 'MTZ File', '2Fo-Fc Map File', 'Fo-Fc Map File', 'Output SMILES']:
         return get_file_link_html(cell_val)
     else:
         # Regular cell with potential highlighting
-        style, display_val = get_cell_style_and_value(col, cell_val, row)
+        style, display_val = get_cell_style_and_value(col, cell_val, row, df)
         return f'<td style="{style}">{display_val}</td>'
 
 
-def save_results_to_html(results: List[Dict[str, Any]], output_file: str, open_browser: bool = True) -> None:
-    """Save results to an interactive HTML file."""
+def save_results_to_html(results: List[Dict[str, Any]], output_file: str, open_browser: bool = True,
+                         quality_plot: str = 'NA', ligand_pca_plot: str = 'NA', 
+                         geometry_pca_plot: str = 'NA', pdb_quality_plot: str = 'NA',
+                         pca_ref: Optional[PCAReference] = None) -> None:
+    """Save results to an interactive HTML file.
+    
+    Note: PCA scores should already be calculated before calling this function.
+    """
     logging.info(f"Generating HTML output with {len(results)} results")
     print(f"Generating HTML report...")
-    
+
+
+    # Implementation
+
     df = pd.DataFrame(results)
+    
+    # Ensure all columns from COLUMN_ORDER exist in the DataFrame
+    for col in COLUMN_ORDER:
+        if col not in df.columns:
+            df[col] = 'NA'
+            logging.debug(f"Added missing column to DataFrame: {col}")
 
-    # Ensure 'Ligand CC' is numeric for sorting, non-numeric values become NaN
-    df['Ligand CC'] = pd.to_numeric(df['Ligand CC'], errors='coerce')
-    # Auto sort by Ligand CC descending (NaNs will be at the end)
-    df = df.sort_values(by='Ligand CC', ascending=False)
-    logging.debug(f"Sorted results by Ligand CC")
+    # Ensure 'Composite Quality Score' is numeric for sorting
+    df['Composite Quality Score'] = pd.to_numeric(df['Composite Quality Score'], errors='coerce')
+    df = df.sort_values(by='Composite Quality Score', ascending=False)
+    logging.debug(f"Sorted results by Composite Quality Score")
 
-    # Define the desired column order (ensure it's always defined)
     column_order = COLUMN_ORDER
 
-    # Build table rows with actual cell values in the new order
-    table_rows = []
-    for _, row in df.iterrows():
-        row_html = '<tr>'
-        for col in column_order:
-            row_html += get_cell_html(col, row[col], row)
-        row_html += '</tr>'
-        table_rows.append(row_html)
-
-    # Render table header HTML outside JS template
-    table_header_html = ''.join([f'<th>{col}</th>' for col in column_order])
+    # Convert DataFrame to list of dicts for template
+    results_data = df.to_dict('records')
     
-    # Calculate Ligand CC column index for sorting
-    ligand_cc_index = column_order.index('Ligand CC') if 'Ligand CC' in column_order else 0
+    quality_score_index = column_order.index('Composite Quality Score') if 'Composite Quality Score' in column_order else 0
 
-    html_content = f"""
-    <!DOCTYPE html>
-    <html lang=\"en\">
-    <head>
-        <meta charset=\"UTF-8\">
-        <title>Pipedream XChem Results</title>
-        <link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css\">
-        <link rel=\"stylesheet\" href=\"https://cdn.datatables.net/1.13.4/css/dataTables.bootstrap5.min.css\">
-        <script src=\"https://code.jquery.com/jquery-3.6.0.min.js\"></script>
-        <script src=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js\"></script>
-        <script src=\"https://cdn.datatables.net/1.13.4/js/jquery.dataTables.min.js\"></script>
-        <script src=\"https://cdn.datatables.net/1.13.4/js/dataTables.bootstrap5.min.js\"></script>
-        <style>
-            html, body {{
-                width: 100vw;
-                min-width: 100vw;
-                margin: 0;
-                padding: 0;
-                background-color: white;
-            }}
-            .container {{
-                width: 100vw !important;
-                max-width: 100vw !important;
-                padding: 2rem 0.5rem;
-            }}
-            .table-responsive {{
-                width: 100vw !important;
-                max-width: 100vw !important;
-                overflow-x: auto;
-            }}
-            table {{
-                width: 100% !important;
-            }}
-            table img {{
-                max-width: 150px;
-                height: auto;
-            }}
-            /* Move DataTables search box to the left */
-            div.dataTables_filter {{
-                float: left !important;
-                text-align: left !important;
-            }}
-            /* Remove top scroll bar by disabling scroll on head */
-            .dataTables_scrollHead {{
-                overflow-x: hidden !important;
-                overflow-y: hidden;
-            }}
-            .dataTables_scrollFoot {{
-                overflow-x: auto !important;
-                overflow-y: hidden;
-            }}
-            .dataTables_scrollBody {{
-                overflow-x: auto !important;
-                overflow-y: auto !important;
-                max-height: 60vh;
-            }}
-            /* Highlighted cells style is inline */
-            /* Make checkboxes in Export to XCE column bigger */
-            td input[type=checkbox] {{
-                transform: scale(1.5);
-                width: 20px;
-                height: 20px;
-                margin: 4px;
-            }}
-            /* File link styling */
-            .file-link {{
-                color: #0066cc;
-                text-decoration: none;
-                cursor: pointer;
-            }}
-            .file-link:hover {{
-                color: #0052a3;
-                text-decoration: underline;
-            }}
-            /* Modal styling */
-            .modal-body iframe {{
-                border: none;
-                width: 100%;
-                height: 70vh;
-            }}
-            .modal-xl {{
-                max-width: 90vw;
-            }}
-        </style>
-        <script>
-            // Embed the original JSON filename for export
-            const originalJsonFilename = "{os.path.basename(output_file).replace('.html', '.json')}";
-            
-            // Function to attach modal event handlers
-            function attachModalHandlers() {{
-                // Modal popup for file links
-                $(document).off('click', '.file-link').on('click', '.file-link', function(e) {{
-                    e.preventDefault();
-                    var fileUrl = $(this).data('file');
-                    var ext = $(this).data('ext');
-                    var fileName = $(this).text();
-                    var modalBody = $('#fileModal .modal-body');
-                    var modalTitle = $('#fileModalLabel');
-                    
-                    modalBody.empty();
-                    modalTitle.text('File Viewer - ' + fileName);
-                    
-                    if(ext === '.html') {{
-                        modalBody.append(`<iframe src="${{fileUrl}}" style="width:100%;height:70vh;border:none;"></iframe>`);
-                    }} else if(ext === '.pdb' || ext === '.mtz' || ext === '.map') {{
-                        modalBody.append(`
-                            <div class="alert alert-info">
-                                <h6>File Information:</h6>
-                                <p><strong>File:</strong> ${{fileName}}</p>
-                                <p><strong>Path:</strong> ${{fileUrl.replace('file://', '')}}</p>
-                                <p><strong>Type:</strong> ${{ext.toUpperCase()}} file</p>
-                            </div>
-                            <div class="d-grid gap-2">
-                                <a href="${{fileUrl}}" class="btn btn-primary" download>Download File</a>
-                                <button class="btn btn-secondary" onclick="navigator.clipboard.writeText('${{fileUrl.replace('file://', '')}}'); alert('Path copied to clipboard!')">Copy Path</button>
-                            </div>
-                        `);
-                    }} else if(ext === '.png' || ext === '.jpg' || ext === '.jpeg' || ext === '.gif') {{
-                        modalBody.append(`<img src="${{fileUrl}}" class="img-fluid" alt="${{fileName}}" style="max-width:100%;height:auto;">`);
-                    }} else {{
-                        modalBody.append(`
-                            <div class="alert alert-info">
-                                <h6>File Information:</h6>
-                                <p><strong>File:</strong> ${{fileName}}</p>
-                                <p><strong>Path:</strong> ${{fileUrl.replace('file://', '')}}</p>
-                            </div>
-                            <div class="d-grid gap-2">
-                                <a href="${{fileUrl}}" class="btn btn-primary" target="_blank">Open File</a>
-                                <button class="btn btn-secondary" onclick="navigator.clipboard.writeText('${{fileUrl.replace('file://', '')}}'); alert('Path copied to clipboard!')">Copy Path</button>
-                            </div>
-                        `);
-                    }}
-                    
-                    var modal = new bootstrap.Modal(document.getElementById('fileModal'));
-                    modal.show();
-                }});
-            }}
-            
-            
-            $(document).ready(function() {{
-                $('#resultsTable').DataTable({{
-                    responsive: true,
+    # Helper functions for template
+    def get_cell_content(col, cell_val, row_dict):
+        """Get cell content for template - returns dict with type and data."""
+        # Convert dict back to Series for existing helper functions
+        row_series = pd.Series(row_dict)
+        
+        if col == 'Export to XCE':
+            return {'type': 'checkbox', 'checked': cell_val == "True"}
+        elif col == 'Comments':
+            return {'type': 'input', 'value': cell_val}
+        elif col == 'Ligand Structure':
+            return {'type': 'image', 'src': cell_val, 'alt': 'Ligand Image', 'width': '150'} if cell_val and cell_val != 'NA' else {'type': 'empty'}
+        elif col == 'Ligand Density':
+            return {'type': 'image', 'src': cell_val, 'alt': 'Ligand Density', 'width': '180', 'style': 'max-width:180px;max-height:120px;'} if cell_val and cell_val != 'NA' else {'type': 'empty'}
+        elif col in ['PCA Percentile Plot (Batch)', 'PCA Percentile Plot (PDB)', 'Spider Plot']:
+            if cell_val and cell_val != 'NA' and str(cell_val).endswith('.html'):
+                return {'type': 'file_button', 'path': os.path.abspath(cell_val), 'ext': '.html'}
+            return {'type': 'empty'}
+        elif col == 'Chiral inversion':
+            # Check if stereochemistry matches (starts with 'Stereochemistry matches input')
+            is_match = cell_val and (cell_val.startswith('Stereochemistry matches input') or cell_val == 'Not checked')
+            return {'type': 'text', 'value': cell_val, 'style': 'color:red;font-weight:bold' if not is_match else ''}
+        elif col in ['Pipedream Directory', 'Buster Report HTML', 'Ligand Report HTML', 'Pipedream Summary',
+                     'PDB File', 'MTZ File', '2Fo-Fc Map File', 'Fo-Fc Map File', 'Output SMILES']:
+            if not cell_val or cell_val == 'NA':
+                return {'type': 'empty'}
+            file_ext = os.path.splitext(cell_val)[1].lower()
+            return {'type': 'file_button', 'path': cell_val, 'ext': file_ext}
+        else:
+            style, display_val = get_cell_style_and_value(col, cell_val, row_series, df)
+            return {'type': 'text', 'value': display_val, 'style': style}
 
-                    pageLength: 25,
-                    order: [[{ligand_cc_index}, 'desc']], // Ligand CC column index (0-based)
-                    columnDefs: [
-                        {{ targets: '_all', type: 'num' }}
-                    ],
-                    scrollX: true,
-                    scrollY: '60vh',
-                    scrollCollapse: true,
-                    fixedHeader: true,
-                    dom: 'Bflrt<"bottom-scrollbar"ip>',
-                }});
-                
-                // Attach modal handlers initially
-                attachModalHandlers();
-                
-                // Only sync scroll for bottom
-                function syncScroll() {{
-                    var scrollBody = $('.dataTables_scrollBody')[0];
-                    var scrollFoot = $('.dataTables_scrollFoot')[0];
-                    if(scrollBody && scrollFoot) {{
-                        scrollFoot.scrollLeft = scrollBody.scrollLeft;
-                    }}
-                }}
-                $('.dataTables_scrollBody').on('scroll', syncScroll);
-            }});
-            // --- Add exportToJSON function ---
-            function exportToJSON() {{
-                var table = $('#resultsTable').DataTable();
-                var data = [];
-                var headers = [];
-                // Get headers
-                $('#resultsTable thead th').each(function() {{
-                    headers.push($(this).text());
-                }});
-                // Get data from visible rows
-                table.rows({{ search: 'applied' }}).every(function(rowIdx, tableLoop, rowLoop) {{
-                }});
-                // Get data from visible rows
-                table.rows({{ search: 'applied' }}).every(function(rowIdx, tableLoop, rowLoop) {{
-                    var rowNode = this.node();
-                    var rowData = {{}};
-                    $(rowNode).find('td').each(function(i, cell) {{
-                        var col = headers[i];
-                        if (col === 'Export to XCE') {{
-                            var checked = $(cell).find('input[type=checkbox]').is(':checked');
-                            rowData[col] = checked ? 'True' : 'False';
-                        }} else if (col === 'Comments') {{
-                            var val = $(cell).find('input[type=text]').val();
-                            rowData[col] = val !== undefined ? val : '';
-                        }} else if (col === 'Ligand Structure' || col === 'Ligand Density') {{
-                            var img = $(cell).find('img');
-                            if (img.length > 0) {{
-                                var src = img.attr('src') || '';
-                                // Remove file:// prefix if present
-                                rowData[col] = src.startsWith('file://') ? src.substring(7) : src;
-                            }} else {{
-                                rowData[col] = '';
-                            }}
-                        }} else if ([
-                            'Pipedream Directory', 'Buster Report HTML', 'Ligand Report HTML', 'Pipedream Summary',
-                            'PDB File', 'MTZ File', '2Fo-Fc Map File', 'Fo-Fc Map File', 'Output SMILES File'
-                                               ].includes(col)) {{
-                            var link = $(cell).find('a.file-link');
-                            if (link.length > 0) {{
-                                var file = link.data('file') || '';
-                                // Remove file:// prefix if present
-                                rowData[col] = file.startsWith('file://') ? file.substring(7) : file;
-                            }} else {{
-                                rowData[col] = '';
-                            }}
-                        }} else {{
-                            // Remove HTML tags from cell
-                            var cellText = $(cell).text();
-                            rowData[col] = cellText;
-                        }}
-                    }});
-                    data.push(rowData);
-                }});
-                var jsonStr = JSON.stringify(data, null, 2);
-                var blob = new Blob([jsonStr], {{type: 'application/json'}});
-                var a = document.createElement('a');
-                a.href = URL.createObjectURL(blob);
-                a.download = originalJsonFilename;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-            }}
-            // --- Add loadJsonAndUpdateTable function ---
-            function loadJsonAndUpdateTable(event) {{
-                var file = event.target.files[0];
-                if (!file) return;
-                var reader = new FileReader();
-                reader.onload = function(e) {{
-                    try {{
-                        var jsonData = JSON.parse(e.target.result);
-                        // Remove current table
-                        $('#resultsTable').DataTable().destroy();
-                        $('#resultsTable tbody').empty();
-                        // Rebuild table body
-                        jsonData.forEach(function(row) {{
-                            var rowHtml = '<tr>';
-                            Object.values(row).forEach(function(cell, i) {{
-                                var col = Object.keys(row)[i];
-                                if (col === 'Export to XCE') {{
-                                    rowHtml += '<td><input type="checkbox" ' + (cell === 'True' ? 'checked' : '') + '></td>';
-                                }} else if (col === 'Comments') {{
-                                    rowHtml += '<td><input type="text" value="' + (cell || '') + '"></td>';
-                                }} else if (col === 'Ligand Structure') {{
-                                    rowHtml += (cell && cell !== 'NA') ? '<td><img src="file://' + cell + '" alt="Ligand Image" width="150"></td>' : '<td></td>';
-                                }} else if (col === 'Ligand Density') {{
-                                    rowHtml += (cell && cell !== 'NA') ? '<td><img src="file://' + cell + '" alt="Ligand Density" width="180" style="max-width:180px;max-height:120px;"></td>' : '<td></td>';                        }} else if (col === 'Chiral inversion') {{
-                            rowHtml += (cell && cell !== 'Output stereochemistry matches input' && cell !== 'Not checked') ? '<td style="color:red;font-weight:bold">' + cell + '</td>' : '<td>' + cell + '</td>';
-                        }} else if (col === 'Pipedream Directory' || col === 'Buster Report HTML' || col === 'Ligand Report HTML' || col === 'Pipedream Summary' || col === 'PDB File' || col === 'MTZ File' || col === '2Fo-Fc Map File' || col === 'Fo-Fc Map File' || col === 'Output SMILES') {{
-                                    if (cell && cell !== 'NA') {{
-                                        var fileExt = '.' + cell.split('.').pop().toLowerCase();
-                                        var fileName = cell.split(/[\\/]/).pop();
-                                        rowHtml += '<td><a href="#" class="file-link" data-file="file://' + cell + '" data-ext="' + fileExt + '">' + fileName + '</a></td>';
-                                    }} else {{
-                                        rowHtml += '<td></td>';
-                                    }}
-                                }} else {{
-                                    rowHtml += '<td>' + (cell || '') + '</td>';
-                                }}
-                            }});
-                            rowHtml += '</tr>';
-                            $('#resultsTable tbody').append(rowHtml);
-                        }});
-                        // Re-initialize DataTable
-                        $('#resultsTable').DataTable({{
-                            responsive: true,
-                            pageLength: 25,
-                            order: [[{ligand_cc_index}, 'desc']],
-                            columnDefs: [{{ targets: '_all', type: 'num' }}],
-                            scrollX: true,
-                            scrollY: '60vh',
-                            scrollCollapse: true,
-                            fixedHeader: true,
-                            dom: 'Bflrt<"bottom-scrollbar"ip>',
-                        }});
-                        
-                        // Reattach modal handlers after table rebuild
-                        attachModalHandlers();
-                        
-                        alert('Table updated successfully with ' + jsonData.length + ' records.');
-                    }} catch (err) {{
-                        alert('Error parsing JSON file: ' + err.message);
-                        console.error('JSON parsing error:', err);
-                    }}
-                }};
-                reader.readAsText(file);
-            }}
-            
-            function selectAllExport() {{
-                $('#resultsTable tbody input[type=checkbox]').prop('checked', true);
-            }}
-            function unselectAllExport() {{
-                $('#resultsTable tbody input[type=checkbox]').prop('checked', false);
-            }}
-        </script>
-    </head>
-    <body>
-        <div class="container">
-            <div class="mb-3 d-flex flex-wrap gap-2 align-items-center">
-                <input type="file" id="jsonFileInput" accept="application/json" style="display:none" onchange="loadJsonAndUpdateTable(event)">
-                <button class="btn btn-warning" onclick="document.getElementById('jsonFileInput').click()">Load JSON and Update Table</button>
-                <button class="btn btn-success" onclick="exportToJSON()">Export Table to JSON</button>
-                <button class="btn btn-primary" onclick="selectAllExport()">Select All</button>
-                <button class="btn btn-secondary" onclick="unselectAllExport()">Unselect All</button>
-            </div>
-            <h1 class="text-center">Pipedream XChem Results</h1>
-            <div class="table-responsive">
-                <table id="resultsTable" class="table table-striped table-bordered">
-                    <thead>
-                        <tr>
-                            {table_header_html}
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {''.join(table_rows)}
-                    </tbody>
-                </table>
-            </div>
-        </div>
-        <!-- Modal HTML -->
-        <div class="modal fade" id="fileModal" tabindex="-1" aria-labelledby="fileModalLabel" aria-hidden="true">
-          <div class="modal-dialog modal-xl">
-            <div class="modal-content">
-              <div class="modal-header">
-                <h5 class="modal-title" id="fileModalLabel">File Viewer</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-              </div>
-              <div class="modal-body" id="fileModalBody">
-                <!-- Content will be dynamically loaded here -->
-              </div>
-              <div class="modal-footer">
-                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
-              </div>
-            </div>
-          </div>
-        </div>
-    </body>
-    </html>
-    """
+    # Prepare template context
+    template_context = {
+        'original_json_filename': os.path.basename(output_file).replace('.html', '.json'),
+        'quality_score_index': quality_score_index,
+        'column_order': column_order,
+        'column_tooltips': COLUMN_TOOLTIPS,
+        'results': results_data,
+        'get_cell_content': get_cell_content,
+        'os': os,  # For os.path functions
+        'quality_plot_exists': quality_plot != 'NA' and os.path.exists(quality_plot),
+        'quality_plot_path': os.path.abspath(quality_plot) if quality_plot != 'NA' and os.path.exists(quality_plot) else '',
+        'pdb_quality_plot_exists': pdb_quality_plot != 'NA' and os.path.exists(pdb_quality_plot),
+        'pdb_quality_plot_path': os.path.abspath(pdb_quality_plot) if pdb_quality_plot != 'NA' and os.path.exists(pdb_quality_plot) else '',
+        'ligand_pca_plot_exists': ligand_pca_plot != 'NA' and os.path.exists(ligand_pca_plot),
+        'ligand_pca_plot_path': os.path.abspath(ligand_pca_plot) if ligand_pca_plot != 'NA' and os.path.exists(ligand_pca_plot) else '',
+        'geometry_pca_plot_exists': geometry_pca_plot != 'NA' and os.path.exists(geometry_pca_plot),
+        'geometry_pca_plot_path': os.path.abspath(geometry_pca_plot) if geometry_pca_plot != 'NA' and os.path.exists(geometry_pca_plot) else '',
+    }
+
+    # Load and render template
+    template_dir = os.path.join(os.path.dirname(__file__), 'templates')
+    env = Environment(
+        loader=FileSystemLoader(template_dir),
+        autoescape=select_autoescape(['html', 'xml'])
+    )
+    template = env.get_template('results_table.html')
+    html_content = template.render(**template_context)
 
     with open(output_file, 'w', encoding='utf-8') as f:
         f.write(html_content)
@@ -1804,6 +2542,7 @@ def save_results_to_html(results: List[Dict[str, Any]], output_file: str, open_b
         webbrowser.open(f'file://{os.path.abspath(output_file)}')
 
 
+
 def save_results_to_json(results: List[Dict[str, Any]], output_file: str) -> None:
     """Save results to a JSON file with a consistent column order."""
     # Use the same column order as for HTML
@@ -1812,8 +2551,6 @@ def save_results_to_json(results: List[Dict[str, Any]], output_file: str) -> Non
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(ordered_results, f, indent=2)
     logging.info(f"Results saved to {os.path.basename(output_file)}")
-
-
 
 def main() -> None:
     """Main entry point for collating Pipedream results."""
@@ -1829,7 +2566,7 @@ def main() -> None:
     )
     parser.add_argument(
         '--input', '--json', '-i',
-        dest='input_json',
+        dest='input',
         required=True, 
         help='Path to the JSON file with dataset metadata'
     )
@@ -1853,6 +2590,11 @@ def main() -> None:
         help='Don\'t automatically open HTML report in browser'
     )
     parser.add_argument(
+        '--no-plots',
+        action='store_true',
+        help='Don\'t automatically open plot PNG files'
+    )
+    parser.add_argument(
         '--verbose', '-v',
         action='store_true',
         help='Enable verbose console output'
@@ -1867,11 +2609,11 @@ def main() -> None:
     args = parser.parse_args()
     
     # Validate input file exists
-    if not os.path.isfile(args.input_json):
-        parser.error(f"Input JSON file not found: {args.input_json}")
+    if not os.path.isfile(args.input):
+        parser.error(f"Input JSON file not found: {args.input}")
     
     # Validate input file extension
-    if not args.input_json.lower().endswith('.json'):
+    if not args.input.lower().endswith('.json'):
         parser.error("Input file must have a .json extension")
     
     # Determine output directory
@@ -1884,7 +2626,7 @@ def main() -> None:
         except Exception as e:
             parser.error(f"Cannot create output directory: {output_dir} ({e})")
     else:
-        output_dir = os.path.dirname(args.input_json)
+        output_dir = os.path.dirname(args.input)
     
     # Determine output file names
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -1898,7 +2640,7 @@ def main() -> None:
     
     log_file = os.path.join(output_dir, f'{base_name}.log')
     
-    # Configure logging with different levels for file vs console
+    # Configure logging
     logger = logging.getLogger()
     logger.setLevel(getattr(logging, args.log_level))
     
@@ -1908,55 +2650,95 @@ def main() -> None:
     file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     file_handler.setFormatter(file_formatter)
     
-    # Console handler - verbose mode or essential messages only
+    # Console handler - respects verbose flag
     console_handler = logging.StreamHandler()
     if args.verbose:
-        console_handler.setLevel(logging.INFO)
+        console_handler.setLevel(getattr(logging, args.log_level))
     else:
-        console_handler.setLevel(logging.WARNING)
+        console_handler.setLevel(logging.WARNING)  # Only warnings and errors when not verbose
     console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     console_handler.setFormatter(console_formatter)
-    
-    # Add a custom filter for console when not in verbose mode
-    if not args.verbose:
-        class ConsoleFilter(logging.Filter):
-            def filter(self, record):
-                # Allow WARNING and above
-                if record.levelno >= logging.WARNING:
-                    return True
-                # Allow specific INFO messages for terminal
-                if record.levelno == logging.INFO:
-                    essential_messages = [
-                        "JSON file read successfully",
-                        "Processing dataset:",
-                        "Results saved to",
-                        "Result collection completed"
-                    ]
-                    # Check for exact matches or "Processing X datasets" pattern
-                    message = record.getMessage()
-                    if any(msg in message for msg in essential_messages):
-                        return True
-                    # Also allow "Processing X datasets" pattern
-                    if message.startswith("Processing ") and message.endswith(" datasets"):
-                        return True
-                    return False
-        
-        console_handler.addFilter(ConsoleFilter())
     
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
     
+    # Create config without file path
+    config = Config()
+    
+    # Try to load PDB PCA reference data
+    pca_ref = PCAReference()
+    for ref_path in config.pca_reference_paths:
+        if os.path.exists(str(ref_path)):
+            if pca_ref.load_reference(str(ref_path)):
+                print(f"Loaded PDB archive reference data: {ref_path}")
+                break
+    
+    if not pca_ref.loaded:
+        print("Warning: PDB archive reference data not found - PDB percentile scores will be skipped")
+        print("Place 'PCA_PDB_references.csv' in script directory or Data/ subdirectory to enable")
+    
     logging.info("Starting Pipedream results collation")
     print("Starting Pipedream results collation...")
     
-    logging.info(f"Reading JSON file: {args.input_json}")
-    json_data = read_json(args.input_json)
+    # Show note if tqdm is not available
+    if not HAS_TQDM:
+        print("Note: Install tqdm for progress bar support (pip install tqdm)")
+    
+    logging.info(f"Reading JSON file: {args.input}")
+    json_data = read_json(args.input)
     
     logging.info("Validating JSON structure")
     validate_json_structure(json_data)
     
     logging.info("Collecting results from datasets")
-    results = collect_results_from_json(json_data)
+    results = collect_results_from_json(json_data, config)
+    
+    # Calculate PCA scores BEFORE saving JSON or generating HTML
+    logging.info("Calculating PCA percentile scores (batch)")
+    print("Calculating PCA percentile scores...")
+    results = calculate_pca_scores_batch(results, pca_ref)
+    
+    # Generate individual batch percentile plots for each dataset
+    logging.info("Generating individual batch percentile plots...")
+    print("Generating individual batch percentile plots...")
+    for result in results:
+        plot_path = generate_individual_batch_percentile_plot(result, output_dir)
+        result['PCA Percentile Plot (Batch)'] = plot_path
+        logging.info(f"Set PCA Percentile Plot (Batch) for {result.get('Crystal Name')}: {plot_path}")
+    
+    logging.info("Calculating PCA percentile scores (PDB)")
+    results = calculate_pca_scores_pdb(results, pca_ref)
+    
+    # Generate individual PDB percentile plots for each dataset
+    logging.info("Generating individual PDB percentile plots...")
+    print("Generating individual PDB percentile plots...")
+    for result in results:
+        plot_path = generate_individual_pdb_percentile_plot(result, output_dir)
+        result['PCA Percentile Plot (PDB)'] = plot_path
+        logging.info(f"Set PCA Percentile Plot (PDB) for {result.get('Crystal Name')}: {plot_path}")
+    
+    # Generate spider plots for each dataset
+    logging.info("Generating spider plots...")
+    print("Generating spider plots...")
+    for result in results:
+        spider_path = generate_spider_plot(result, output_dir)
+        result['Spider Plot'] = spider_path
+        logging.info(f"Set Spider Plot for {result.get('Crystal Name')}: {spider_path}")
+    
+    # Generate 2D PDB percentile plot (after PDB scores are calculated)
+    logging.info("Generating 2D PDB percentile plot")
+    print("Generating 2D PDB percentile plot...")
+    pdb_quality_plot = generate_pdb_percentile_quality_plot(results, output_dir, base_name)
+    
+    # Generate PCA plots
+    logging.info("Generating PCA plots")
+    print("Generating PCA plots...")
+    ligand_pca_plot, geometry_pca_plot = generate_pca_plots(results, output_dir, base_name)
+    
+    # Generate 2D ligand quality plot (batch comparison)
+    logging.info("Generating 2D ligand quality plot (batch)")
+    print("Generating 2D ligand quality plot (batch)...")
+    quality_plot = generate_ligand_quality_plot(results, output_dir, base_name)
     
     # Generate outputs based on format selection
     if args.format in ['json', 'both']:
@@ -1966,8 +2748,10 @@ def main() -> None:
     
     if args.format in ['html', 'both']:
         logging.info(f"Generating HTML report: {output_file_html}")
-        # Pass the no_browser flag to the HTML generation function
-        save_results_to_html(results, output_file_html, open_browser=not args.no_browser)
+        save_results_to_html(results, output_file_html, open_browser=not args.no_browser,
+                           quality_plot=quality_plot, ligand_pca_plot=ligand_pca_plot,
+                           geometry_pca_plot=geometry_pca_plot, pdb_quality_plot=pdb_quality_plot,
+                           pca_ref=pca_ref)
     
     logging.info("Result collection completed.")
     print("Pipedream results collation completed!")
@@ -1978,6 +2762,10 @@ def main() -> None:
         print(f"  JSON: {output_file_json}")
     if args.format in ['html', 'both']:
         print(f"  HTML: {output_file_html}")
+    if ligand_pca_plot != 'NA':
+        print(f"  PCA (Ligand): {ligand_pca_plot}")
+    if geometry_pca_plot != 'NA':
+        print(f"  PCA (Geometry): {geometry_pca_plot}")
     print(f"  Log:  {log_file}")
 
 

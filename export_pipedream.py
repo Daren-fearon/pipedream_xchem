@@ -17,7 +17,7 @@ Features:
 - Copies BUSTER output files for downstream analysis
 
 Author: DFearon
-Date: October 2025
+Date: November 2025
 """
 
 import os
@@ -32,7 +32,7 @@ import logging
 from datetime import datetime
 
 # Version information
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 # Import RDKit for PNG generation
 try:
@@ -440,7 +440,7 @@ def main():
     # Required arguments
     required_group = parser.add_argument_group('required arguments')
     required_group.add_argument(
-        "--input", "-i",
+        "--input", "--json", "-i",
         required=True,
         help="Path to the Pipedream results JSON file"
     )

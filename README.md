@@ -95,7 +95,8 @@ The pipeline automatically:
 
 | File | Purpose |
 |------|----------|
-| `pipedream_xchem.py` (or `pipedream_xchem_dev.py`) | Submits SLURM jobs for Pipedream refinement |
+| `pipedream_xchem.py` | Submits SLURM jobs for Pipedream refinement (includes automatic map generation and edstats) |
+| `pipedream_post_process.py` | Standalone script for reprocessing old data (backwards compatibility) |
 | `collate_pipedream_results.py` | Aggregates results and performs chirality analysis |
 | `export_pipedream.py` | Exports results to XCE format and updates the database |
 | `pipedream_parameters.yaml` | Configuration file for refinement parameters |
@@ -115,6 +116,9 @@ Processing_directory: /dls/labxchem/data/proposal/visit/processing
 Output_directory: /dls/labxchem/data/proposal/visit/processing/Pipedream/Pipedream_output_123  # Optional
 Database_path: /dls/labxchem/data/proposal/visit/processing/database/soakDBDataFile.sqlite
 Dataset_csv_path: /dls/labxchem/data/proposal/visit/processing/Pipedream/datasets.csv  # Required for 'specific_datasets' mode
+
+Cluster_partition: "cs05r"  # Optional: cs05r or cs04r (default: cs05r)
+Job_priority: "low"          # Optional: normal, low, high (default: normal)
 
 Remove_crystallisation_components: true  # Optional
 Refinement_parameters:
@@ -136,6 +140,8 @@ Refinement_parameters:
 - **Output_directory**: Optional - defaults to `<processing_directory>/analysis/Pipedream/Pipedream_<timestamp>` if not set
 - **Database_path**: Path to SQLite database with dataset metadata
 - **Dataset_csv_path**: **Required for 'specific_datasets' mode** - CSV file with `CrystalName` column
+- **Cluster_partition**: Optional - SLURM partition to use (`cs05r` or `cs04r`, default: `cs05r`)
+- **Job_priority**: Optional - Job priority using SLURM nice value (`normal`, `low`, `high`, default: `normal`). `low` sets nice=1000 (runs after other jobs), `high` sets nice=-100 (higher priority)
 - **Remove_crystallisation_components**: Optional - removes DMS, EDO, GOL, SO4, PO4, PEG from input PDBs
 - **Refinement_parameters**: Options passed to Pipedream ([see documentation](https://www.globalphasing.com/buster/manual/pipedream/manual/index.html#_details_of_command_line_arguments))
 
@@ -273,13 +279,14 @@ python /dls/science/groups/i04-1/software/pipedream_xchem/collate_pipedream_resu
 #### Command-Line Options
 
 **Required:**
-- `--input`, `-i` - Path to Pipedream output JSON file
+- `--input`, `--json`, `-i` - Path to Pipedream output JSON file
 
 **Output Options:**
 - `--output-dir DIR` - Output directory for reports (default: same as input JSON)
 - `--output-name NAME` - Base name for output files (default: `Pipedream_results_<timestamp>`)
 - `--format {json,html,both}` - Output format(s) (default: both)
 - `--no-browser` - Don't automatically open HTML report
+- `--no-plots` - Don't automatically open plot PNG files
 
 **Logging Options:**
 - `--verbose`, `-v` - Enable verbose console output
@@ -290,13 +297,12 @@ python /dls/science/groups/i04-1/software/pipedream_xchem/collate_pipedream_resu
 
 This script:
 - Collates results from completed Pipedream runs
-- Performs chirality inversion detection by comparing input SMILES/PDB with output PDB structures
-- Extracts ligand validation statistics (correlation coefficients, B-factors, etc.)
-- Analyzes MolProbity and structural quality metrics
-- Extracts SMILES from refined ligand structures
-- Generates electron density maps from MTZ files using gemmi
-- Creates interactive HTML reports with file links and data filtering
-- Outputs comprehensive JSON metadata
+- Performs chirality inversion detection
+- Extracts ligand validation statistics and quality metrics
+- Creates interactive HTML reports with filtering
+- Outputs comprehensive JSON metadata for export
+
+> **Note:** Maps and edstats are generated automatically during the pipeline, making collation fast.
 
 #### Outputs
 
@@ -315,7 +321,7 @@ python /dls/science/groups/i04-1/software/pipedream_xchem/export_pipedream.py --
 #### Command-Line Options
 
 **Required:**
-- `--input`, `-i` - Path to collation results JSON file
+- `--input`, `--json`, `-i` - Path to collation results JSON file
 - `--parameters`, `-p` - Path to YAML parameters file
 
 **Logging Options:**
@@ -340,17 +346,15 @@ This script:
 
 | Error | Cause | Fix |
 |-------|--------|-----|
-| `Missing required file paths` | Datasets lack MTZ or PDB paths in database | Check `soakDBDataFile.sqlite` for missing entries or use `--dry-run` to identify issues |
-| `Could not find CIF file` | CIF file missing in expected location | Check `input_files/` or `rhofit-<CompoundCode>/` directories in output |
-| `SLURM job not submitted` | SSH or authentication issue | Ensure SSH key authentication to `wilson.diamond.ac.uk` is configured (`~/.ssh/id_rsa`) |
+| `Missing required file paths` | Datasets lack MTZ/PDB paths | Check database or use `--dry-run` |
+| `Could not find CIF file` | Restraints missing | Check `input_files/` or `rhofit-*/` directories |
+| `SLURM job not submitted` | SSH authentication issue | Configure SSH keys to `wilson.diamond.ac.uk` |
 | `RDKit not available` | RDKit not installed | `micromamba install -c conda-forge rdkit` |
-| `gemmi not available` | gemmi not installed for map generation | `micromamba install -c conda-forge gemmi` |
-| `grade2 failed` | CSD not available or invalid SMILES | Check CSD installation at `/dls_sw/apps/CSDS/` or verify SMILES strings in database |
-| `No valid SMILES available` | Missing or invalid SMILES in database | Update database with valid SMILES strings (check for 'none', 'null', 'nan' values) |
-| `Chirality inversion detected` | Stereochemistry changed during refinement | Review output SMILES file and consider manual inspection; updated restraints automatically copied |
-| `BUSTER dependency check failed` | Module not loaded or missing dependencies | Run `module load buster` before script execution (cluster nodes load automatically) |
-| `grade2 exit code: 5` | Restraint generation failed on cluster | Check SMILES validity and CSD availability on cluster nodes |
-| `Array job chunked` | > 1000 datasets | Normal behavior - jobs automatically split into chunks of 1000 |
+| `grade2 failed` | Invalid SMILES or CSD unavailable | Verify SMILES in database, check CSD installation |
+| `No valid SMILES available` | Missing SMILES in database | Update database with valid SMILES |
+| `Chirality inversion detected` | Stereochemistry changed | Review output; restraints auto-copied |
+| `Array job chunked` | > 1000 datasets | Normal - auto-split into chunks of 1000 |
+| `Maps or edstats missing` | Post-processing failed | Check SLURM logs; reprocess with `pipedream_post_process.py --input <output.json>` |
 
 ### Additional Notes
 
@@ -378,14 +382,15 @@ This script:
 ## 📬 Contact
 
 For questions or issues, please contact:  
-📧 [xchem@diamond.ac.uk](mailto:xchem@diamond.ac.uk) or [daren.fearon@diamond.ac.uk](mailto:daren.fearon@diamond.ac.uk)
+📧 [xchem@diamond.ac.uk](mailto:xchem@diamond.ac.uk)
 
 ---
 
 ## 📝 Version Information
 
-- **pipedream_xchem_dev.py**: v1.0.2
-- **collate_pipedream_results.py**: v1.0.1
-- **export_pipedream.py**: v1.0.1
+- **pipedream_xchem.py**: v1.0.2
+- **collate_pipedream_results.py**: v1.0.2
+- **export_pipedream.py**: v1.0.2
+- **pipedream_post_process.py**: v1.0.0
 
 Check version: `python <script>.py --version`

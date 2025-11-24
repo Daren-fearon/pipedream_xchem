@@ -4,8 +4,13 @@ channels:
 dependencies:
   - python=3.10
   - gemmi
+  - jinja2
+  - matplotlib
+  - numpy
   - pandas
   - paramiko
+  - plotly
   - pyyaml
   - rdkit
-  - webbrowser
+  - scikit-learn
+  - tqdm
