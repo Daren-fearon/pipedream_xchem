@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Pipedream XChem Results</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
+    <link rel="stylesheet" href="https://cdn.datatables.net/1.13.4/css/dataTables.bootstrap5.min.css">
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.datatables.net/1.13.4/js/jquery.dataTables.min.js"></script>
+    <script src="https://cdn.datatables.net/1.13.4/js/dataTables.bootstrap5.min.js"></script>
+    <style>
+        html, body {
+            width: 100vw;
+            min-width: 100vw;
+            margin: 0;
+            padding: 0;
+            background-color: white;
+        }
+        .container {
+            width: 100vw !important;
+            max-width: 100vw !important;
+            padding: 2rem 0.5rem;
+        }
+        .table-responsive {
+            width: 100vw !important;
+            max-width: 100vw !important;
+            overflow-x: auto;
+        }
+        table {
+            width: 100% !important;
+        }
+        table td, table th {
+            text-align: center !important;
+            vertical-align: middle !important;
+        }
+        table img {
+            max-width: 150px;
+            height: auto;
+        }
+        /* Move DataTables search box to the left */
+        div.dataTables_filter {
+            float: left !important;
+            text-align: left !important;
+        }
+        /* Remove top scroll bar by disabling scroll on head */
+        .dataTables_scrollHead {
+            overflow-x: hidden !important;
+            overflow-y: hidden;
+        }
+        .dataTables_scrollFoot {
+            overflow-x: auto !important;
+            overflow-y: hidden;
+        }
+        .dataTables_scrollBody {
+            overflow-x: auto !important;
+            overflow-y: auto !important;
+            max-height: 60vh;
+        }
+        /* Highlighted cells style is inline */
+        /* Make checkboxes in Export To XCE column bigger */
+        td input[type=checkbox] {
+            transform: scale(1.5);
+            width: 20px;
+            height: 20px;
+            margin: 4px;
+        }
+        /* File link styling */
+        .file-link {
+            color: #0066cc;
+            text-decoration: none;
+            cursor: pointer;
+        }
+        .file-link:hover {
+            color: #0052a3;
+            text-decoration: underline;
+        }
+        /* Modal styling - File Modal for HTML reports */
+        .modal-body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 10px;
+            overflow: auto;
+        }
+        .modal-body iframe {
+            border: none;
+            width: 100%;
+            height: 85vh;
+        }
+        .modal-xl {
+            max-width: 95vw;
+        }
+        .modal-content {
+            max-height: 95vh;
+        }
+        /* Aggregate plot modal (modal-xl) for 2D Quality and PCA plots */
+        #plotModal .modal-dialog {
+            max-width: 98vw;
+        }
+        #plotModal .modal-body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 10px;
+            overflow: auto;
+        }
+        #plotModal .modal-body iframe {
+            border: none;
+            width: 100%;
+            height: 82vh;
+        }
+        #plotModal .modal-content {
+            max-height: 95vh;
+        }
+        /* Individual plot modal (modal-lg, square) */
+        #individualPlotModal .modal-body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 10px;
+            overflow: hidden;
+        }
+        #individualPlotModal .modal-body iframe {
+            border: none;
+            width: 80vh;
+            height: 80vh;
+            max-width: 90vw;
+        }
+        #individualPlotModal .modal-content {
+            max-height: 95vh;
+        }
+        #individualPlotModal .modal-dialog {
+            max-width: 85vh;
+        }
+    </style>
+    <script>
+        // Embed the original JSON filename for export
+        const originalJsonFilename = "{{ original_json_filename }}";
+        const fileLinkColumns = [
+            'Pipedream Directory', 'Buster Report HTML', 'Ligand Report HTML', 
+            'Pipedream Summary', 'PDB File', 'MTZ File', '2Fo-Fc Map File', 
+            'Fo-Fc Map File', 'Output SMILES'
+        ];
+        const plotLinkColumns = [
+            'Spider Plot', 'PCA Percentile Plot (Batch)', 'PCA Percentile Plot (PDB)'
+        ];
+
+        // Function to attach modal event handlers
+        function attachModalHandlers() {
+
+            // Modal popup for file links
+            $(document).off('click', '.file-link').on('click', '.file-link', function(e) {
+                e.preventDefault();
+                var fileUrl = $(this).data('file');
+                var ext = $(this).data('ext');
+                var fileName = $(this).text();
+                
+                console.log('Opening file:', fileUrl, 'Extension:', ext, 'Name:', fileName);
+                
+                // Determine modal type based on file type
+                var isAggregatePlot = fileName === '2D Quality Plot' || fileName === 'Ligand Fit PCA Plot' || fileName === 'Ligand Geometry PCA Plot';
+                var isIndividualPlot = fileUrl.includes('pdb_percentile_plots/') || 
+                                      fileUrl.includes('batch_percentile_plots/') ||
+                                      fileUrl.includes('spider_plots/') ||
+                                      fileUrl.includes('_percentile.html') ||
+                                      fileUrl.includes('_spider.html');
+                
+                // Route to appropriate modal
+                var modalId;
+                if (isAggregatePlot) {
+                    modalId = 'plotModal';  // Large modal for aggregate plots
+                } else if (isIndividualPlot) {
+                    modalId = 'individualPlotModal';  // Medium modal for individual plots
+                } else {
+                    modalId = 'fileModal';  // Extra large modal for other files
+                }
+                
+                var modalBody = $('#' + modalId + ' .modal-body');
+                var modalTitle = $('#' + modalId + 'Label');
+                
+                modalBody.empty();
+                
+                // Set appropriate title
+                var displayTitle = fileName;
+                if (isIndividualPlot && fileName === 'View') {
+                    if (fileUrl.includes('pdb_percentile_plots/')) {
+                        displayTitle = 'PCA Percentile Plot (PDB)';
+                    } else if (fileUrl.includes('batch_percentile_plots/')) {
+                        displayTitle = 'PCA Percentile Plot (Batch)';
+                    } else if (fileUrl.includes('spider_plots/')) {
+                        displayTitle = 'Spider Plot';
+                    }
+                }
+                modalTitle.text((isAggregatePlot || isIndividualPlot ? '' : 'File Viewer - ') + displayTitle);
+                
+                if(ext === '.html') {
+                    // Create iframe with ID for resize handling
+                    var iframeId = 'contentIframe_' + Date.now();
+                    modalBody.append(`<iframe id="${iframeId}" src="${fileUrl}" style="width:100%;height:85vh;border:none;"></iframe>`);
+                    
+                    // Try to inject resize script into iframe after load (for plotly content)
+                    setTimeout(function() {
+                        try {
+                            var iframe = document.getElementById(iframeId);
+                            if (iframe && iframe.contentWindow) {
+                                // Send resize message to iframe content
+                                iframe.contentWindow.postMessage({
+                                    type: 'resize',
+                                    width: modalBody.width(),
+                                    height: modalBody.height()
+                                }, '*');
+                                
+                                // Try to access iframe content if same-origin
+                                try {
+                                    var iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
+                                    if (iframeDoc) {
+                                        // Find plotly divs and trigger resize
+                                        var plotlyDivs = iframeDoc.querySelectorAll('.plotly');
+                                        plotlyDivs.forEach(function(div) {
+                                            if (window.Plotly && iframe.contentWindow.Plotly) {
+                                                iframe.contentWindow.Plotly.Plots.resize(div);
+                                            }
+                                        });
+                                    }
+                                } catch (err) {
+                                    console.log('Cross-origin iframe, cannot directly access content:', err);
+                                }
+                            }
+                        } catch (err) {
+                            console.log('Error resizing iframe content:', err);
+                        }
+                    }, 500);
+                } else if(ext === '.pdb' || ext === '.mtz' || ext === '.map') {
+
+                    modalBody.append(`
+                        <div class="alert alert-info">
+                            <h6>File Information:</h6>
+                            <p><strong>File:</strong> ${fileName}</p>
+                            <p><strong>Path:</strong> ${fileUrl.replace('file://', '')}</p>
+                            <p><strong>Type:</strong> ${ext.toUpperCase()} file</p>
+                        </div>
+                        <div class="d-grid gap-2">
+                            <a href="${fileUrl}" class="btn btn-primary" download>Download File</a>
+                            <button class="btn btn-secondary" onclick="navigator.clipboard.writeText('${fileUrl.replace('file://', '')}'); alert('Path copied to clipboard!')">Copy Path</button>
+                        </div>
+                    `);
+                } else if(ext === '.png' || ext === '.jpg' || ext === '.jpeg' || ext === '.gif') {
+
+                    modalBody.append(`<img src="${fileUrl}" class="img-fluid" alt="${fileName}" style="max-width:100%;height:auto;">`);
+                } else {
+                    modalBody.append(`
+                        <div class="alert alert-info">
+                            <h6>File Information:</h6>
+                            <p><strong>File:</strong> ${fileName}</p>
+                            <p><strong>Path:</strong> ${fileUrl.replace('file://', '')}</p>
+                        </div>
+                        <div class="d-grid gap-2">
+                            <a href="${fileUrl}" class="btn btn-primary" target="_blank">Open File</a>
+                            <button class="btn btn-secondary" onclick="navigator.clipboard.writeText('${fileUrl.replace('file://', '')}'); alert('Path copied to clipboard!')">Copy Path</button>
+                        </div>
+                    `);
+                }
+                
+                var modal = new bootstrap.Modal(document.getElementById(modalId));
+                modal.show();
+                
+                // Add event listener for modal shown event to trigger resize
+                $('#' + modalId).on('shown.bs.modal', function() {
+                    var iframe = modalBody.find('iframe')[0];
+                    if (iframe && iframe.contentWindow) {
+                        setTimeout(function() {
+                            try {
+                                var iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
+                                if (iframeDoc) {
+                                    var plotlyDivs = iframeDoc.querySelectorAll('.plotly');
+                                    plotlyDivs.forEach(function(div) {
+                                        if (iframe.contentWindow.Plotly) {
+                                            iframe.contentWindow.Plotly.Plots.resize(div);
+                                        }
+                                    });
+                                }
+                            } catch (err) {
+                                console.log('Cannot resize plotly in iframe:', err);
+                            }
+                        }, 200);
+                    }
+                });
+            });
+        }
+        
+        // Function to show PDB percentile plot in modal
+        function showPlotModal(plotPath, datasetName) {
+            console.log('Opening plot:', plotPath, 'for dataset:', datasetName);
+            
+            var modalBody = $('#plotModal .modal-body');
+            var modalTitle = $('#plotModalLabel');
+            
+            modalBody.empty();
+            modalTitle.text('PDB Comparison - ' + datasetName);
+            
+            // Convert relative path to absolute file:// URL
+            var baseDir = window.location.href.substring(0, window.location.href.lastIndexOf('/'));
+            var fullPath = baseDir + '/' + plotPath;
+            
+            modalBody.append(`<img src="${fullPath}" class="img-fluid" alt="PDB Percentile Plot" style="max-width:100%;height:auto;">`);
+            
+            var modal = new bootstrap.Modal(document.getElementById('plotModal'));
+            modal.show();
+        }
+        
+        $(document).ready(function() {
+            // Custom sorting plugin for numeric columns with "NA" values
+            // NA values should always sort to the bottom regardless of sort direction
+            $.fn.dataTable.ext.type.order['num-with-na-pre'] = function(data) {
+                if (data === 'NA' || data === '' || data === null || data === undefined) {
+                    return null; // Mark as null for special handling
+                }
+                var num = parseFloat(data);
+                return isNaN(num) ? null : num;
+            };
+            
+            $.fn.dataTable.ext.type.order['num-with-na-asc'] = function(a, b) {
+                // null (NA values) always go to bottom in ascending
+                if (a === null && b === null) return 0;
+                if (a === null) return 1;  // a goes after b
+                if (b === null) return -1; // b goes after a
+                return a - b;
+            };
+            
+            $.fn.dataTable.ext.type.order['num-with-na-desc'] = function(a, b) {
+                // null (NA values) always go to bottom in descending
+                if (a === null && b === null) return 0;
+                if (a === null) return 1;  // a goes after b
+                if (b === null) return -1; // b goes after a
+                return b - a;
+            };
+            
+            $('#resultsTable').DataTable({
+                responsive: true,
+
+                pageLength: 25,
+                order: [[{{ quality_score_index }}, 'desc']], // Composite Quality Score column index (0-based)
+                columnDefs: [
+                    { targets: [2, 3, 4], type: 'string' }, // Crystal Name, Ligand ID, Compound Code as strings
+                    { targets: '_all', type: 'num-with-na' }
+                ],
+                scrollX: true,
+                scrollY: '60vh',
+                scrollCollapse: true,
+                fixedHeader: true,
+                dom: 'Bflrt<"bottom-scrollbar"ip>',
+            });
+            
+            // Initialize Bootstrap tooltips
+            var tooltipTriggerList = [].slice.call(document.querySelectorAll('[title]'));
+            tooltipTriggerList.map(function (tooltipTriggerEl) {
+                return new bootstrap.Tooltip(tooltipTriggerEl);
+            });
+            
+            // Attach modal handlers initially
+            attachModalHandlers();
+            
+            // Only sync scroll for bottom
+            function syncScroll() {
+                var scrollBody = $('.dataTables_scrollBody')[0];
+                var scrollFoot = $('.dataTables_scrollFoot')[0];
+                if(scrollBody && scrollFoot) {
+                    scrollFoot.scrollLeft = scrollBody.scrollLeft;
+                }
+            }
+            $('.dataTables_scrollBody').on('scroll', syncScroll);
+        });
+        // --- Add exportToJSON function ---
+        function exportToJSON() {
+            var table = $('#resultsTable').DataTable();
+            var data = [];
+            var headers = [];
+            // Get headers
+            $('#resultsTable thead th').each(function() {
+                headers.push($(this).text());
+            });
+            // Get data from visible rows
+            table.rows({ search: 'applied' }).every(function(rowIdx, tableLoop, rowLoop) {
+                var rowNode = this.node();
+                var rowData = {};
+                $(rowNode).find('td').each(function(i, cell) {
+                    var col = headers[i];
+                    if (col === 'Export to XCE') {
+                        var checked = $(cell).find('input[type=checkbox]').is(':checked');
+                        rowData[col] = checked ? 'True' : 'False';
+                    } else if (col === 'Comments') {
+                        var val = $(cell).find('input[type=text]').val();
+                        rowData[col] = val !== undefined ? val : '';
+                    } else if (col === 'Ligand Structure' || col === 'Ligand Density') {
+                        var img = $(cell).find('img');
+                        if (img.length > 0) {
+                            var src = img.attr('src') || '';
+                            // Remove file:// prefix if present
+                            rowData[col] = src.startsWith('file://') ? src.substring(7) : src;
+                        } else {
+                            rowData[col] = '';
+                        }
+                    } else if (col === 'Chiral Inversion') {
+                        rowData[col] = $(cell).text().trim();
+                    } else if (fileLinkColumns.includes(col) || plotLinkColumns.includes(col)) {
+                        var link = $(cell).find('a.file-link');
+                        if (link.length > 0) {
+                            var file = link.data('file') || '';
+                            // Remove file:// prefix if present
+                            rowData[col] = file.startsWith('file://') ? file.substring(7) : file;
+                        } else {
+                            rowData[col] = '';
+                        }
+                    } else {
+                        // Remove HTML tags from cell and preserve numeric types
+                        var cellText = $(cell).text().trim();
+                        // Try to convert to number if it looks like a number
+                        if (cellText !== '' && cellText !== 'NA' && !isNaN(cellText) && !isNaN(parseFloat(cellText))) {
+                            rowData[col] = parseFloat(cellText);
+                        } else {
+                            rowData[col] = cellText;
+                        }
+                    }
+                });
+                data.push(rowData);
+            });
+            // Prompt for filename
+            var defaultFilename = originalJsonFilename.replace('.json', '_selected.json');
+            var filename = prompt('Enter filename for export:', defaultFilename);
+            if (!filename) return; // User cancelled
+            if (!filename.endsWith('.json')) filename += '.json';
+            
+            var jsonStr = JSON.stringify(data, null, 2);
+            var blob = new Blob([jsonStr], {type: 'application/json'});
+            var a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }
+        // --- Add loadJsonAndUpdateTable function ---
+        function loadJsonAndUpdateTable(event) {
+            var file = event.target.files[0];
+            if (!file) return;
+            var reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    var jsonData = JSON.parse(e.target.result);
+                    // Remove current table
+                    $('#resultsTable').DataTable().destroy();
+                    $('#resultsTable tbody').empty();
+                    // Rebuild table body
+                    jsonData.forEach(function(row) {
+                        var rowHtml = '<tr>';
+                        Object.values(row).forEach(function(cell, i) {
+                            var col = Object.keys(row)[i];
+                            if (col === 'Export to XCE') {
+                                rowHtml += '<td><input type="checkbox" ' + (cell === 'True' ? 'checked' : '') + '></td>';
+                            } else if (col === 'Comments') {
+                                rowHtml += '<td><input type="text" value="' + (cell || '') + '"></td>';
+                            } else if (col === 'Ligand Structure' || col === 'Ligand Density') {
+                                rowHtml += (cell && cell !== 'NA') ? '<td><img src="file://' + cell + '" alt="Ligand Image" width="150"></td>' : '<td></td>';
+                            } else if (col === 'Chiral Inversion') {
+                        rowHtml += (cell && cell !== 'Output stereochemistry matches input' && cell !== 'Not checked') ? '<td style="color:red;font-weight:bold">' + cell + '</td>' : '<td>' + cell + '</td>';
+                    } else if (plotLinkColumns.includes(col)) {
+                                if (cell && cell !== 'NA' && cell !== '') {
+                                    var fileExt = '.' + cell.split('.').pop().toLowerCase();
+                                    rowHtml += '<td><a href="#" class="btn btn-sm btn-outline-primary file-link" data-file="file://' + cell + '" data-ext="' + fileExt + '" style="padding:5px 10px;text-decoration:none;">View</a></td>';
+                                } else {
+                                    rowHtml += '<td></td>';
+                                }
+                            } else if (fileLinkColumns.includes(col)) {
+                                if (cell && cell !== 'NA') {
+                                    var fileExt = '.' + cell.split('.').pop().toLowerCase();
+                                    var fileName = cell.split(/[\\\/]/).pop();
+                                    rowHtml += '<td><a href="#" class="file-link" data-file="file://' + cell + '" data-ext="' + fileExt + '">' + fileName + '</a></td>';
+                                } else {
+                                    rowHtml += '<td></td>';
+                                }
+                            } else {
+                                // Remove HTML tags from cell
+                                var cellText = $(cell).text();
+                                rowHtml += '<td>' + (cellText || '') + '</td>';
+                            }
+                        });
+                        rowHtml += '</tr>';
+                        $('#resultsTable tbody').append(rowHtml);
+                    });
+                    // Re-initialize DataTable with custom sorting
+                    $('#resultsTable').DataTable({
+                        responsive: true,
+                        pageLength: 25,
+                        order: [[{{ quality_score_index }}, 'desc']],
+                        columnDefs: [
+                            { targets: [2, 3, 4], type: 'string' }, // Crystal Name, Ligand ID, Compound Code as strings
+                            { targets: '_all', type: 'num-with-na' }
+                        ],
+                        scrollX: true,
+                        scrollY: '60vh',
+                        scrollCollapse: true,
+                        fixedHeader: true,
+                        dom: 'Bflrt<"bottom-scrollbar"ip>',
+                    });
+                    
+                    // Reattach modal handlers after table rebuild
+                    attachModalHandlers();
+                    
+                    alert('Table updated successfully with ' + jsonData.length + ' records.');
+                } catch (err) {
+                    alert('Error parsing JSON file: ' + err.message);
+                    console.error('JSON parsing error:', err);
+                }
+            };
+            reader.readAsText(file);
+        }
+        
+        function selectAllExport() {
+            $('#resultsTable tbody input[type=checkbox]').prop('checked', true);
+        }
+        function unselectAllExport() {
+            $('#resultsTable tbody input[type=checkbox]').prop('checked', false);
+        }
+    </script>
+</head>
+<body>
+    <div class="container">
+        <div class="mb-3 d-flex flex-wrap gap-2 align-items-center justify-content-between">
+            <div class="d-flex flex-wrap gap-2">
+                <a href="#" class="btn btn-outline-primary file-link{{ '' if quality_plot_exists else ' disabled' }}" data-file="file://{{ quality_plot_path }}" data-ext=".html">2D Quality Plot (Batch)</a>
+                <a href="#" class="btn btn-outline-primary file-link{{ '' if pdb_quality_plot_exists else ' disabled' }}" data-file="file://{{ pdb_quality_plot_path }}" data-ext=".html">PCA Percentile Plot (PDB)</a>
+                <a href="#" class="btn btn-outline-primary file-link{{ '' if ligand_pca_plot_exists else ' disabled' }}" data-file="file://{{ ligand_pca_plot_path }}" data-ext=".html">Ligand Fit PCA Plot</a>
+                <a href="#" class="btn btn-outline-primary file-link{{ '' if geometry_pca_plot_exists else ' disabled' }}" data-file="file://{{ geometry_pca_plot_path }}" data-ext=".html">Ligand Geometry PCA Plot</a>
+            </div>
+            <div class="d-flex flex-wrap gap-2">
+                <input type="file" id="jsonFileInput" accept="application/json" style="display:none" onchange="loadJsonAndUpdateTable(event)">
+                <button class="btn btn-warning" onclick="document.getElementById('jsonFileInput').click()">Load JSON and Update Table</button>
+                <button class="btn btn-success" onclick="exportToJSON()">Export Table to JSON</button>
+                <button class="btn btn-primary" onclick="selectAllExport()">Select All Datasets</button>
+                <button class="btn btn-secondary" onclick="unselectAllExport()">Unselect All Datasets</button>
+            </div>
+        </div>
+        <h1 class="text-center">Pipedream XChem Results</h1>
+        <div class="table-responsive">
+            <table id="resultsTable" class="table table-striped table-bordered">
+                <thead>
+                    <tr>
+                        {% for col in column_order %}
+                        <th{% if col in column_tooltips %} title="{{ column_tooltips[col] }}"{% endif %}>{{ col }}</th>
+                        {% endfor %}
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in results %}
+                    <tr>
+                        {% for col in column_order %}
+                        {% set cell = get_cell_content(col, row[col], row) %}
+                        {% if cell.type == 'checkbox' %}
+                        <td><input type="checkbox"{% if cell.checked %} checked{% endif %}></td>
+                        {% elif cell.type == 'input' %}
+                        <td><input type="text" value="{{ cell.value }}"></td>
+                        {% elif cell.type == 'image' %}
+                        <td><img src="file://{{ cell.src }}" alt="{{ cell.alt }}" width="{{ cell.width }}"{% if cell.style %} style="{{ cell.style }}"{% endif %}></td>
+                        {% elif cell.type == 'file_button' %}
+                        <td><a href="#" class="btn btn-sm btn-outline-primary file-link" data-file="file://{{ cell.path }}" data-ext="{{ cell.ext }}" style="padding:5px 10px;text-decoration:none;">View</a></td>
+                        {% elif cell.type == 'text' %}
+                        <td{% if cell.style %} style="{{ cell.style }}"{% endif %}>{{ cell.value }}</td>
+                        {% else %}
+                        <td></td>
+                        {% endif %}
+                        {% endfor %}
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    <!-- Modal HTML -->
+    <div class="modal fade" id="fileModal" tabindex="-1" aria-labelledby="fileModalLabel" aria-hidden="true">
+      <div class="modal-dialog modal-xl">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title" id="fileModalLabel">File Viewer</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body" id="fileModalBody">
+            <!-- Content will be dynamically loaded here -->
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- Aggregate Plot Modal (for 2D Quality, PCA plots) -->
+    <div class="modal fade" id="plotModal" tabindex="-1" aria-labelledby="plotModalLabel" aria-hidden="true">
+      <div class="modal-dialog modal-xl">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title" id="plotModalLabel">Plot Viewer</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body text-center" id="plotModalBody">
+            <!-- Plot will be dynamically loaded here -->
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- Individual Plot Modal (for per-dataset percentile plots) -->
+    <div class="modal fade" id="individualPlotModal" tabindex="-1" aria-labelledby="individualPlotModalLabel" aria-hidden="true">
+      <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title" id="individualPlotModalLabel">Individual Plot</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body text-center" id="individualPlotModalBody">
+            <!-- Plot will be dynamically loaded here -->
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+          </div>
+        </div>
+      </div>
+    </div>
+</body>
+</html>
