@@ -564,7 +564,7 @@ def main():
         log_to_file_only(f"Starting processing for crystal: {crystal}")
         
         # Validate critical fields exist in JSON entry
-        required_fields = ["Crystal Name", "Compound Code", "Pipedream Directory", "Pipedream Summary"]
+        required_fields = ["Crystal Name", "Compound Code", "Pipedream Directory"]
         missing_fields = [field for field in required_fields if not entry.get(field)]
         if missing_fields:
             logging.error(f"Missing required fields for crystal {crystal}: {missing_fields}")
@@ -644,26 +644,23 @@ def main():
             else:
                 log_crystal_progress(crystal, f"pipedream directory already exists at {dest_pipedream}")
             
-            # Get original file paths
-            mtz_file = entry["MTZ File"]
-            bound_pdb = entry["PDB File"]
-            
-            # Create paths to the copied files in the destination directory
-            mtz_file_dest = mtz_file.replace(pipedream_dir, dest_pipedream)
-            bound_pdb_dest = bound_pdb.replace(pipedream_dir, dest_pipedream)
-            
-            # For XCE symlinks, we need the postrefine files, not rhofit files
-            # The MTZ file should already be from postrefine directory
-            # But the PDB file might be from rhofit, so we need to construct the postrefine path
+            # Construct file paths directly from Pipedream directory structure
+            # Standard Pipedream output locations in postrefine directory
+            mtz_file_dest = os.path.join(dest_pipedream, f"postrefine-{compound_code}", "refine.mtz")
             postrefine_pdb = os.path.join(dest_pipedream, f"postrefine-{compound_code}", "refine.pdb")
             
-            # Use postrefine PDB if it exists, otherwise fall back to bound_pdb_dest
-            if os.path.exists(postrefine_pdb):
-                main_pdb_dest = postrefine_pdb
-                log_crystal_progress(crystal, f"using postrefine PDB for main symlinks: {postrefine_pdb}")
-            else:
-                main_pdb_dest = bound_pdb_dest
-                log_crystal_progress(crystal, f"postrefine PDB not found, using: {bound_pdb_dest}")
+            # Verify files exist and log warnings if they don't
+            if not os.path.exists(mtz_file_dest):
+                log_crystal_progress(crystal, f"WARNING: MTZ file not found at expected location: {mtz_file_dest}")
+                logging.warning(f"MTZ file not found for crystal {crystal}: {mtz_file_dest}")
+            
+            if not os.path.exists(postrefine_pdb):
+                log_crystal_progress(crystal, f"WARNING: postrefine PDB file not found at expected location: {postrefine_pdb}")
+                logging.warning(f"Postrefine PDB not found for crystal {crystal}: {postrefine_pdb}")
+            
+            # Use postrefine PDB as main destination
+            main_pdb_dest = postrefine_pdb
+            log_crystal_progress(crystal, f"using postrefine files: PDB={postrefine_pdb}, MTZ={mtz_file_dest}")
 
             log_crystal_progress(crystal, f"creating symlinks")
             log_crystal_progress(crystal, f"  - {main_pdb_dest} -> {os.path.join(target_dir, 'refine.pdb')}")
@@ -698,7 +695,8 @@ def main():
             else:
                 log_crystal_progress(crystal, f"no Fo-Fc map file specified in JSON")
 
-            summary_path = entry["Pipedream Summary"]
+            # Construct summary path from Pipedream Directory
+            summary_path = os.path.join(pipedream_dir, "pipedream_summary.json")
             with open(summary_path, "r") as f:
                 summary = json.load(f)
 
